@@ -41,6 +41,7 @@ import {
   DIGEST_NUDGE_TEXT,
   digestNudgeMarkerPath,
   jobUsageMarkerPath,
+  readJobObservation,
 } from "./index.ts";
 import type {
   EntryRenderer,
@@ -414,7 +415,7 @@ test("job: unified tool dispatches run, status, tail, and grep", async () => {
   });
 });
 
-test("job: maos.eval metadata renders bounded structured state", async () => {
+test("job: legacy typed metadata remains readable without domain-specific rendering", async () => {
   await withJobsDir(async (dir, { tools, ctx }) => {
     const statePath = join(dir, "eval-state.json");
     const summaryPath = join(dir, "eval-report.md");
@@ -455,12 +456,10 @@ test("job: maos.eval metadata renders bounded structured state", async () => {
       undefined,
       ctx,
     );
-    assert.match(status.content[0].text, /kind: maos\.eval/);
-    assert.match(status.content[0].text, /run: decision-quality/);
-    assert.match(status.content[0].text, /eval phase: running/);
-    assert.match(status.content[0].text, /eval profile: heavy · fable/);
-    assert.match(status.content[0].text, /eval workspace: \/tmp\/eval-rift/);
-    assert.match(status.content[0].text, /summary: .*eval-report\.md/);
+    assert.match(status.content[0].text, /legacy kind: maos\.eval/);
+    assert.match(status.content[0].text, /legacy run: decision-quality/);
+    assert.match(status.content[0].text, /legacy summary: .*eval-report\.md/);
+    assert.doesNotMatch(status.content[0].text, /eval phase|eval profile|eval workspace/);
     assert.doesNotMatch(status.content[0].text, /must-not-render/);
     assert.equal(status.details.metadata.kind, "maos.eval");
   });
@@ -490,6 +489,98 @@ test("job: typed metadata requires kind and validates paths", async () => {
       /kind must be/,
     );
   });
+});
+
+test("job: universal observation reports semantic failure after exit 0", async () => {
+  await withJobsDir(async (_dir, { tools, ctx }) => {
+    const job = tools.get("job")!;
+    const payload = JSON.stringify({
+      version: 1,
+      seq: 2,
+      updatedAt: "2026-09-23T00:00:00.000Z",
+      status: "failed",
+      summary: "0/4 usable trials",
+      progress: { done: 0, total: 4, unit: "trials" },
+      artifacts: [{ label: "report", path: "/tmp/report.md" }],
+    });
+    const started = await job.execute(
+      "observed-job-run",
+      {
+        action: "run",
+        command: `printf '%s' '${payload}' > "$PI_JOB_OBSERVATION_PATH.next"; mv "$PI_JOB_OBSERVATION_PATH.next" "$PI_JOB_OBSERVATION_PATH"`,
+        wake: "never",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForLogExit(started.details.logPath);
+
+    const status = await job.execute(
+      "observed-job-status",
+      { action: "status", id: started.details.id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(status.details.exitCode, 0);
+    assert.equal(status.details.verdict, "failed");
+    assert.equal(status.details.observation.status, "failed");
+    assert.match(status.content[0].text, /verdict: failed/);
+    assert.match(status.content[0].text, /summary: 0\/4 usable trials/);
+    assert.match(status.content[0].text, /progress: 0\/4 trials/);
+    assert.match(status.content[0].text, /artifact \(report\): \/tmp\/report\.md/);
+  });
+});
+
+test("job: wake=failure wakes on a blocked semantic outcome with exit 0", async () => {
+  await withJobsDir(async (_dir, { tools, ctx, wakes }) => {
+    const job = tools.get("job")!;
+    const payload = JSON.stringify({
+      version: 1,
+      seq: 1,
+      updatedAt: "2026-09-23T00:00:00.000Z",
+      status: "blocked",
+      summary: "Fresh commissioning required",
+    });
+    const started = await job.execute(
+      "blocked-job-run",
+      {
+        action: "run",
+        command: `printf '%s' '${payload}' > "$PI_JOB_OBSERVATION_PATH.next"; mv "$PI_JOB_OBSERVATION_PATH.next" "$PI_JOB_OBSERVATION_PATH"`,
+        wake: "failure",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForLogExit(started.details.logPath);
+    await waitForWakes(wakes, 1);
+    assert.match(wakes[0].text, /^❌/);
+    assert.match(wakes[0].text, /Outcome: blocked — Fresh commissioning required/);
+  });
+});
+
+test("job observation reader rejects symlinks and oversized files", () => {
+  const dir = mkTmp("observation-safety-");
+  const target = join(dir, "target.json");
+  const link = join(dir, "observation.json");
+  writeFileSync(
+    target,
+    JSON.stringify({
+      version: 1,
+      seq: 1,
+      updatedAt: "2026-09-23T00:00:00.000Z",
+      status: "succeeded",
+      summary: "forged",
+    }),
+  );
+  symlinkSync(target, link);
+  assert.deepEqual(readJobObservation(link), { kind: "invalid" });
+
+  const oversized = join(dir, "oversized.json");
+  writeFileSync(oversized, "x".repeat(64 * 1024 + 1));
+  assert.deepEqual(readJobObservation(oversized), { kind: "invalid" });
 });
 
 test("job: cancel terminates a running process without a completion wake", async () => {
@@ -6576,7 +6667,7 @@ test("bgrun: a capped job leaves no staging files behind", async () => {
   });
 });
 
-test("bgclean: stale staging files (.ec/.fifo/.pid/.trunc) are reclaimed, unrelated .tmp-* are not", async () => {
+test("bgclean: stale staging and observation files are reclaimed, unrelated .tmp-* are not", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
   try {
@@ -6589,6 +6680,8 @@ test("bgclean: stale staging files (.ec/.fifo/.pid/.trunc) are reclaimed, unrela
       ".tmp-spew-1-abcd.pid",
       ".tmp-spew-1-abcd.trunc",
       ".tmp-spew-1-abcd.log",
+      ".jobobs-abcd.json",
+      ".jobobs-abcd.pid",
     ];
     const foreign = ".tmp-someone-else.txt";
     for (const name of [foreign, ...ours]) {

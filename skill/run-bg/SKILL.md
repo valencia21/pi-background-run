@@ -47,9 +47,10 @@ for old transcripts, but normal sessions expose only `job`.
    - `wake: "failure"` when success needs no model turn;
    - `wake: "never"` for independent work.
    When the project's digest config defines `type` entries, pass the matching `type`.
-   For a domain workflow with structured state, optionally pass `kind`, `runId`,
-   `statePath`, and `summaryPath`; these affect status presentation only. Use
-   `kind: "maos.eval"` for MAOS eval workers. Unknown kinds stay generic.
+   Domain workflows can publish a universal semantic snapshot to the injected
+   `PI_JOB_OBSERVATION_PATH`; use this for progress, outcome, and artifact links.
+   The older `kind`, `runId`, `statePath`, and `summaryPath` fields are legacy
+   compatibility metadata and should not be used for new producers.
    Record the returned id and continue other work.
 2. **On wake**, trust the exit status first. A configured `digest (<label>):` block is a
    short project-specific scorecard and often answers what failed.

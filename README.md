@@ -49,7 +49,7 @@ The five `bg*` tools remain registered so saved transcripts and existing integra
 Every job accepts `wake: "never" | "failure" | "always"`:
 
 - `never` keeps model context quiet; completion still updates the toast/widget and persists status/logs.
-- `failure` wakes only for a non-zero exit or spawn failure.
+- `failure` wakes for a non-zero exit, spawn failure, or a producer-reported `failed`, `blocked`, or mismatched semantic outcome.
 - `always` preserves the original behavior and wakes on every completion.
 
 Omitting `wake` uses `defaultWake` from layered configuration (`PI_BGRUN_WAKE`
@@ -64,32 +64,44 @@ turn, and `never` for independent work. Foreground execution remains the default
 for routine focused commands; do not choose background execution from command
 category alone.
 
-## Typed workflow metadata
+## Universal producer observations
 
-Jobs remain the only process supervisor. Domain workflows can optionally attach
-presentation metadata without changing spawn, cancellation, wake, or cleanup behavior:
+`job` remains only a process supervisor. Any finite producer—an eval, monitor,
+batch, report, or delegated worker—may publish semantic progress and outcome to
+the path supplied in `PI_JOB_OBSERVATION_PATH`. Plain commands can ignore it and
+retain exit-code-only behavior.
+
+The producer-owned snapshot has one universal shape:
 
 ```ts
-job({
-  action: "run",
-  command: "node eval-worker.mjs …",
-  name: "eval-decision-quality",
-  kind: "maos.eval",
-  runId: "decision-quality",
-  statePath: "~/.cache/pi-maos-eval-workers/decision-quality/state.json",
-  summaryPath: "~/agent-interface/evals/2026-09-22-decision-quality.md",
-  wake: "always"
-})
+type JobObservation = {
+  version: 1
+  seq: number
+  updatedAt: string
+  status: "running" | "succeeded" | "failed" | "blocked"
+  summary: string
+  progress?: { done: number; total?: number; unit?: string }
+  artifacts?: Array<{ label: string; path: string }>
+}
 ```
 
-`job status <id>` always shows generic process state. For `maos.eval`, it also
-reads a bounded (64 KiB maximum) regular JSON state file and renders only the
-whitelisted phase, mode, model, and workspace fields plus the summary path. It
-never renders arbitrary state keys. Unknown kinds retain generic rendering.
-Metadata persists in the session transcript across `/reload`.
+Publish by writing a complete file with mode `0600` to a unique sibling path,
+then atomically renaming it over `PI_JOB_OBSERVATION_PATH`. Write the final
+snapshot before exiting. The extension reads at most 64 KiB through a regular,
+non-symlink file descriptor; bounds strings and artifact counts; strips terminal
+controls; never opens artifacts; and treats malformed observations as a visible
+mismatch.
 
-`type` remains reserved for digest scorecard selection; `kind` identifies the
-optional typed workflow.
+Process exit and semantic outcome are intentionally separate. Exit zero plus
+`failed` or `blocked` is not shown as success. Non-zero exit plus `succeeded`,
+or exit zero while the last observation remains `running`, is a mismatch.
+`wake: "failure"` uses this reconciled verdict. Logs remain the event history;
+the snapshot is only current state, so no event store or domain adapter is
+needed.
+
+The older `kind`, `runId`, `statePath`, and `summaryPath` fields remain readable
+for transcript compatibility but are deprecated. New producers should use the
+observation contract. `type` remains separate and selects digest scorecards.
 
 ## Slash commands
 
@@ -104,7 +116,7 @@ instead of disappearing in a notification.
 | `/job grep <id> <pattern>` | Search a job's bounded log window with a regular expression. |
 | `/job cancel <id>` | Send SIGTERM to the exact job's detached process group. |
 | `/job clean [days] [--all]` | Remove old logs, session-scoped unless `--all` is present. |
-| `/job run --wake <never\|failure\|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>` | Start a managed job with an explicit wake policy and optional typed-workflow metadata. |
+| `/job run --wake <never\|failure\|always> [--name <name>] -- <command>` | Start a managed job with an explicit wake policy. Legacy typed-metadata flags remain accepted for compatibility. |
 | `/job help` | Show command usage. |
 
 `/bgstatus`, `/bgtail`, and `/bgclean` remain compatibility aliases. There are
@@ -126,8 +138,9 @@ agent calls job(action: "run", command: "gh run watch …", name: "deploy-monito
        <wrapper> = the output-ceiling pipeline (see "Log size ceiling"), or the
        uncapped one-liner 'sh -c "$1"; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit "$ec"'
        when the ceiling is disabled (maxLogBytes: 0)
+  → injects PI_JOB_OBSERVATION_PATH for optional atomic producer snapshots
   → records job in-memory + appends a bgrun-job entry to the session
-  → returns "started: <job-id>"
+  → returns "started: <job-id>" plus log and observation paths
 
 child 'exit' event fires while the same extension generation is active:
   → extension records exit code, appends a done entry

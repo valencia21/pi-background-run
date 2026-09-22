@@ -47,6 +47,7 @@ import { spawn } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
   fstatSync,
   readSync,
@@ -130,6 +131,10 @@ const PROJECT_LOCAL_JOBS_REL = ".pi-bgrun/jobs";
 // truncation-flag files. Only these exact suffixes are ours — an unrelated
 // `.tmp-*` is not.
 const STAGING_SUFFIXES = [".log", ".ec", ".fifo", ".pid", ".trunc"];
+const OBSERVATION_PREFIX = ".jobobs-";
+const OBSERVATION_MAX_BYTES = 64 * 1024;
+const OBSERVATION_SUMMARY_MAX = 240;
+const OBSERVATION_ARTIFACTS_MAX = 10;
 // A staging file is only reclaimable once it is clearly nobody's business: the
 // owner's liveness file says the wrapper is gone AND the file is older than this
 // floor. Without the floor, an aggressive cleanup cutoff (a `bgclean` "clean
@@ -1413,6 +1418,151 @@ export function formatDuration(ms: number): string {
   return `${m}:${String(rem).padStart(2, "0")}`;
 }
 
+export type JobObservationStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "blocked";
+
+export interface JobObservation {
+  version: 1;
+  seq: number;
+  updatedAt: string;
+  status: JobObservationStatus;
+  summary: string;
+  progress?: { done: number; total?: number; unit?: string };
+  artifacts?: Array<{ label: string; path: string }>;
+}
+
+type ObservationRead =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "ok"; observation: JobObservation };
+
+type JobVerdict =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "mismatch";
+
+function observedText(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const clean = value
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "")
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return undefined;
+  return clean.slice(0, max);
+}
+
+export function readJobObservation(path: string | undefined): ObservationRead {
+  if (!path) return { kind: "missing" };
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size <= 0 || info.size > OBSERVATION_MAX_BYTES)
+      return { kind: "invalid" };
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (count <= 0) return { kind: "invalid" };
+      offset += count;
+    }
+    const raw = JSON.parse(buffer.toString("utf8")) as Record<string, unknown>;
+    if (!raw || Array.isArray(raw) || raw.version !== 1)
+      return { kind: "invalid" };
+    if (!Number.isSafeInteger(raw.seq) || Number(raw.seq) < 0)
+      return { kind: "invalid" };
+    if (
+      typeof raw.updatedAt !== "string" ||
+      raw.updatedAt.length > 64 ||
+      !Number.isFinite(Date.parse(raw.updatedAt))
+    )
+      return { kind: "invalid" };
+    if (!["running", "succeeded", "failed", "blocked"].includes(String(raw.status)))
+      return { kind: "invalid" };
+    const summary = observedText(raw.summary, OBSERVATION_SUMMARY_MAX);
+    if (!summary) return { kind: "invalid" };
+
+    let progress: JobObservation["progress"];
+    if (raw.progress !== undefined) {
+      if (!raw.progress || typeof raw.progress !== "object" || Array.isArray(raw.progress))
+        return { kind: "invalid" };
+      const p = raw.progress as Record<string, unknown>;
+      if (!Number.isFinite(p.done) || Number(p.done) < 0)
+        return { kind: "invalid" };
+      if (p.total !== undefined && (!Number.isFinite(p.total) || Number(p.total) < 0))
+        return { kind: "invalid" };
+      const unit = p.unit === undefined ? undefined : observedText(p.unit, 32);
+      if (p.unit !== undefined && !unit) return { kind: "invalid" };
+      progress = {
+        done: Number(p.done),
+        ...(p.total !== undefined ? { total: Number(p.total) } : {}),
+        ...(unit ? { unit } : {}),
+      };
+    }
+
+    let artifacts: JobObservation["artifacts"];
+    if (raw.artifacts !== undefined) {
+      if (!Array.isArray(raw.artifacts) || raw.artifacts.length > OBSERVATION_ARTIFACTS_MAX)
+        return { kind: "invalid" };
+      artifacts = [];
+      for (const item of raw.artifacts) {
+        if (!item || typeof item !== "object" || Array.isArray(item))
+          return { kind: "invalid" };
+        const value = item as Record<string, unknown>;
+        const label = observedText(value.label, 80);
+        const artifactPath = observedText(value.path, 4096);
+        if (!label || !artifactPath) return { kind: "invalid" };
+        artifacts.push({ label, path: artifactPath });
+      }
+    }
+
+    return {
+      kind: "ok",
+      observation: {
+        version: 1,
+        seq: Number(raw.seq),
+        updatedAt: raw.updatedAt,
+        status: raw.status as JobObservationStatus,
+        summary,
+        ...(progress ? { progress } : {}),
+        ...(artifacts ? { artifacts } : {}),
+      },
+    };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "invalid" };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function reconcileJobVerdict(
+  exitCode: number | undefined,
+  read: ObservationRead,
+): JobVerdict {
+  if (exitCode === undefined) return "running";
+  if (read.kind === "invalid") return "mismatch";
+  if (read.kind === "missing") return exitCode === 0 ? "succeeded" : "failed";
+  const status = read.observation.status;
+  if (exitCode !== 0) return status === "succeeded" ? "mismatch" : "failed";
+  if (status === "running") return "mismatch";
+  return status;
+}
+
+function verdictIsFailure(verdict: JobVerdict): boolean {
+  return verdict === "failed" || verdict === "blocked" || verdict === "mismatch";
+}
+
 interface JobMetadata {
   kind: string;
   runId?: string;
@@ -1426,7 +1576,8 @@ interface JobRecord {
   cmd: string;
   name?: string; // optional human-readable label
   type?: string; // optional job type used for digest scorecard selection
-  metadata?: JobMetadata; // optional typed-workflow presentation metadata
+  metadata?: JobMetadata; // legacy typed-workflow presentation metadata
+  observationPath?: string; // universal producer-owned semantic snapshot
   wake: WakePolicy; // whether completion injects a model turn
   started: number;
   logPath: string;
@@ -1449,6 +1600,7 @@ interface BgrunJobEntryData {
   name?: string;
   type?: string;
   metadata?: JobMetadata;
+  observationPath?: string;
   wake?: WakePolicy;
   started: number;
   logPath: string;
@@ -1465,6 +1617,9 @@ interface BgStatusDetails {
   name?: string;
   type?: string;
   metadata?: JobMetadata;
+  observationPath?: string;
+  observation?: JobObservation;
+  verdict?: JobVerdict;
   wake?: WakePolicy;
   count?: number;
   recovered?: boolean;
@@ -1577,28 +1732,51 @@ export default function (pi: ExtensionAPI) {
 
   function typedStatusLines(metadata: JobMetadata | undefined): string[] {
     if (!metadata) return [];
-    const lines = [`  kind: ${metadata.kind}`];
-    if (metadata.runId) lines.push(`  run: ${metadata.runId}`);
-    if (metadata.kind === "maos.eval" && metadata.statePath) {
-      try {
-        const info = statSync(metadata.statePath);
-        if (!info.isFile() || info.size > 64 * 1024)
-          throw new Error("state file is not a bounded regular file");
-        const state = JSON.parse(readFileSync(metadata.statePath, "utf8")) as Record<string, unknown>;
-        const phase = typeof state.status === "string" ? state.status : undefined;
-        const mode = typeof state.mode === "string" ? state.mode : undefined;
-        const model = typeof state.model === "string" ? state.model : undefined;
-        const workspace = typeof state.workspace === "string" ? state.workspace : undefined;
-        if (phase) lines.push(`  eval phase: ${sanitizeName(phase)}`);
-        if (mode || model)
-          lines.push(`  eval profile: ${[mode, model].filter(Boolean).map(String).join(" · ")}`);
-        if (workspace) lines.push(`  eval workspace: ${workspace.slice(0, 4096)}`);
-      } catch {
-        lines.push(`  eval state: unavailable (${metadata.statePath})`);
-      }
-    }
-    if (metadata.summaryPath) lines.push(`  summary: ${metadata.summaryPath}`);
+    const lines = [`  legacy kind: ${metadata.kind}`];
+    if (metadata.runId) lines.push(`  legacy run: ${metadata.runId}`);
+    if (metadata.summaryPath) lines.push(`  legacy summary: ${metadata.summaryPath}`);
     return lines;
+  }
+
+  function observationStatusLines(
+    observationPath: string | undefined,
+    exitCode: number | undefined,
+  ): {
+    lines: string[];
+    read: ObservationRead;
+    verdict: JobVerdict;
+  } {
+    const read = readJobObservation(observationPath);
+    const verdict = reconcileJobVerdict(exitCode, read);
+    if (read.kind === "missing") return { lines: [], read, verdict };
+    if (read.kind === "invalid") {
+      return {
+        lines: ["  verdict: mismatch", "  observation: invalid or unsafe"],
+        read,
+        verdict,
+      };
+    }
+    const observation = read.observation;
+    const lines = [`  verdict: ${verdict}`, `  summary: ${observation.summary}`];
+    if (observation.progress) {
+      const { done, total, unit } = observation.progress;
+      lines.push(
+        `  progress: ${done}${total === undefined ? "" : `/${total}`}${unit ? ` ${unit}` : ""}`,
+      );
+    }
+    for (const artifact of observation.artifacts ?? [])
+      lines.push(`  artifact (${artifact.label}): ${artifact.path}`);
+    return { lines, read, verdict };
+  }
+
+  function shouldWakeForVerdict(
+    wake: WakePolicy,
+    exitCode: number,
+    verdict: JobVerdict,
+  ): boolean {
+    if (wake === "always") return true;
+    if (wake === "never") return false;
+    return exitCode !== 0 || verdictIsFailure(verdict);
   }
 
   // Count the log's total lines with a bounded-memory streaming scan (one
@@ -1757,8 +1935,12 @@ export default function (pi: ExtensionAPI) {
       const isStaging =
         name.startsWith(".tmp-") &&
         STAGING_SUFFIXES.some((suffix) => name.endsWith(suffix));
+      const isObservation =
+        name.startsWith(OBSERVATION_PREFIX) &&
+        (name.endsWith(".json") || name.endsWith(".pid"));
       if (
         !isStaging &&
+        !isObservation &&
         !name.startsWith(".bgrun-used-") &&
         !name.startsWith(".digest-nudge-")
       )
@@ -1766,9 +1948,10 @@ export default function (pi: ExtensionAPI) {
       try {
         const markerPath = join(jobsDir, name);
         const mtimeMs = statSync(markerPath).mtimeMs;
-        if (isStaging) {
-          if (mtimeMs > stagingCutoff) continue;
-          const stem = name.replace(/\.[a-z]+$/, "");
+        if (isStaging || isObservation) {
+          const ownedCutoff = isObservation ? cutoff : stagingCutoff;
+          if (mtimeMs > ownedCutoff) continue;
+          const stem = name.replace(/\.(?:json|[a-z]+)$/, "");
           if (stagingOwnerAlive(join(jobsDir, `${stem}.pid`))) continue;
         } else if (mtimeMs > cutoff) {
           continue;
@@ -1876,6 +2059,13 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         unlinkSync(rec.logPath);
+        if (rec.observationPath) {
+          try {
+            unlinkSync(rec.observationPath);
+          } catch {
+            // observation is optional or already swept
+          }
+        }
         result.removed++;
         jobs.delete(rec.id);
         tailBookmarks.delete(rec.id);
@@ -1995,6 +2185,7 @@ export default function (pi: ExtensionAPI) {
       name: rec.name,
       type: rec.type,
       metadata: rec.metadata,
+      observationPath: rec.observationPath,
       wake: rec.wake,
       started: rec.started,
       logPath: rec.logPath,
@@ -2078,20 +2269,39 @@ export default function (pi: ExtensionAPI) {
           state: "running",
         } as BgrunJobEntryData);
       const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-      const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
+      const observed = observationStatusLines(
+        d.observationPath,
+        d.state === "done" ? (d.exitCode ?? -1) : undefined,
+      );
+      const icon = d.state === "done"
+        ? verdictIsFailure(observed.verdict) ? "❌" : "✅"
+        : "🔄";
       const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
+      const verdictStr = d.state === "done" ? ` ${observed.verdict}` : "";
       const namePrefix = d.name ? `"${d.name}" ` : "";
       box.addChild(
         new Text(
-          `${icon} ${theme.fg("accent", d.metadata?.kind ?? "bgrun")} ${namePrefix}${d.id}${exitStr}`,
+          `${icon} ${theme.fg("accent", "job")} ${namePrefix}${d.id}${exitStr}${verdictStr}`,
           0,
           0,
         ),
       );
+      if (observed.read.kind === "ok")
+        box.addChild(
+          new Text(theme.fg("dim", `  ${observed.read.observation.summary}`), 0, 0),
+        );
       const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
       box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
       if (expanded) {
         box.addChild(new Text(theme.fg("dim", `  log: ${d.logPath}`), 0, 0));
+        if (d.observationPath)
+          box.addChild(
+            new Text(
+              theme.fg("dim", `  observation: ${d.observationPath}`),
+              0,
+              0,
+            ),
+          );
         box.addChild(
           new Text(
             theme.fg(
@@ -2155,6 +2365,7 @@ export default function (pi: ExtensionAPI) {
           name: d.name,
           type: d.type,
           metadata: d.metadata,
+          observationPath: d.observationPath,
           wake: d.wake ?? resolveConfig(ctx).defaultWake,
           started: d.started,
           logPath: d.logPath,
@@ -2280,10 +2491,10 @@ export default function (pi: ExtensionAPI) {
             "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
         }),
       ),
-      kind: Type.Optional(Type.String({ description: "Optional typed-workflow kind, such as maos.eval" })),
-      runId: Type.Optional(Type.String({ description: "Optional typed-workflow run identifier" })),
-      statePath: Type.Optional(Type.String({ description: "Optional typed-workflow state JSON path" })),
-      summaryPath: Type.Optional(Type.String({ description: "Optional typed-workflow summary artifact path" })),
+      kind: Type.Optional(Type.String({ description: "Deprecated typed-workflow kind; use PI_JOB_OBSERVATION_PATH" })),
+      runId: Type.Optional(Type.String({ description: "Deprecated typed-workflow run identifier" })),
+      statePath: Type.Optional(Type.String({ description: "Deprecated typed-workflow state path" })),
+      summaryPath: Type.Optional(Type.String({ description: "Deprecated typed-workflow summary path" })),
       wake: Type.Optional(
         Type.Union(
           ["never", "failure", "always"].map((policy) =>
@@ -2363,6 +2574,13 @@ export default function (pi: ExtensionAPI) {
       // guessable and a pre-planted symlink cannot be truncated through.
       const stem = `.tmp-${slug}-${ts}-${randomBytes(4).toString("hex")}`;
       const tmpPath = join(jobsDir, `${stem}.log`);
+      // Stable before spawn so any producer can publish semantic progress and
+      // outcome without the supervisor knowing its domain. Producers write a
+      // complete JSON snapshot to a sibling temp file and atomically rename it
+      // over this path.
+      const observationStem = `${OBSERVATION_PREFIX}${randomBytes(8).toString("hex")}`;
+      const observationPath = join(jobsDir, `${observationStem}.json`);
+      const ownerPidPath = join(jobsDir, `${observationStem}.pid`);
       let logFd: number | undefined;
       let logPath = tmpPath;
       try {
@@ -2394,7 +2612,7 @@ export default function (pi: ExtensionAPI) {
                 join(jobsDir, `${stem}.fifo`),
                 // Liveness, so a cleanup sweep can tell a running job's scratch
                 // files from an orphan's instead of judging them by age alone.
-                join(jobsDir, `${stem}.pid`),
+                ownerPidPath,
                 // Truncation flag: written by the drain when bytes were left
                 // over. A file, not the drain's exit status, because the drain
                 // may still be running when the wrapper prints.
@@ -2404,11 +2622,23 @@ export default function (pi: ExtensionAPI) {
           {
             stdio: ["ignore", logFd, logFd],
             detached: true,
+            env: {
+              ...process.env,
+              PI_JOB_OBSERVATION_PATH: observationPath,
+              PI_JOB_OBSERVATION_VERSION: "1",
+            },
           },
         );
         child.unref();
 
         const childPid = child.pid ?? -1;
+        // Every observation has an owner liveness sidecar, including uncapped
+        // jobs whose simpler wrapper does not otherwise need scratch state.
+        try {
+          writeFileSync(ownerPidPath, String(childPid), { mode: 0o600 });
+        } catch {
+          // Best-effort: a missing sidecar affects retention, never execution.
+        }
         const id = `${slug}-${ts}-${childPid}`;
         const finalLogPath = join(jobsDir, `${id}.log`);
         try {
@@ -2428,6 +2658,7 @@ export default function (pi: ExtensionAPI) {
           name,
           type,
           metadata,
+          observationPath,
           wake,
           started: Date.now(),
           logPath,
@@ -2444,6 +2675,7 @@ export default function (pi: ExtensionAPI) {
           name,
           type,
           metadata,
+          observationPath,
           wake,
           started: Date.now(),
           logPath,
@@ -2461,6 +2693,11 @@ export default function (pi: ExtensionAPI) {
           rec.donePersisted = true;
           delete rec.child;
           try {
+            unlinkSync(ownerPidPath);
+          } catch {
+            // best-effort
+          }
+          try {
             appendFileSync(
               rec.logPath,
               `\n[pi-bgrun] spawn failed: ${err.message}\n${EXIT_MARKER}-1\n`,
@@ -2475,6 +2712,7 @@ export default function (pi: ExtensionAPI) {
             name: rec.name,
             type: rec.type,
             metadata: rec.metadata,
+            observationPath: rec.observationPath,
             wake: rec.wake,
             started: rec.started,
             logPath: rec.logPath,
@@ -2528,11 +2766,18 @@ export default function (pi: ExtensionAPI) {
           // that window could append a second done entry.
           rec.donePersisted = true;
           delete rec.child; // release the handle reference
+          try {
+            unlinkSync(ownerPidPath);
+          } catch {
+            // capped wrappers normally removed it already
+          }
 
           const exitCode = code ?? parseExitFromLogPath(logPath) ?? -1;
           const exitStr =
             exitCode >= 0 ? String(exitCode) : `signal ${signal ?? "?"}`;
-          const exitEmoji = exitCode === 0 ? "✅" : "❌";
+          const observationRead = readJobObservation(rec.observationPath);
+          const verdict = reconcileJobVerdict(exitCode, observationRead);
+          const exitEmoji = verdictIsFailure(verdict) ? "❌" : "✅";
           const lastLine = readLastLogLine(logPath);
 
           // Universal stats — duration + log line count. Non-heuristic, always
@@ -2563,6 +2808,7 @@ export default function (pi: ExtensionAPI) {
             name: rec.name,
             type: rec.type,
             metadata: rec.metadata,
+            observationPath: rec.observationPath,
             wake: rec.wake,
             started: rec.started,
             logPath,
@@ -2582,7 +2828,7 @@ export default function (pi: ExtensionAPI) {
           // that fails, times out, or prints
           // nothing appends nothing, and the exit code / universal part above are
           // never affected.
-          const willWake = shouldWakeAgent(rec.wake, exitCode);
+          const willWake = shouldWakeForVerdict(rec.wake, exitCode, verdict);
           let digestBlock: { label: string; text: string } | undefined;
           if (willWake) {
             try {
@@ -2651,6 +2897,10 @@ export default function (pi: ExtensionAPI) {
             let wakeMessage = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
             wakeMessage += `Command: ${command}\n`;
             wakeMessage += `Stats: ${statsParts.join(", ")}\n`;
+            if (observationRead.kind === "ok")
+              wakeMessage += `Outcome: ${observationRead.observation.status} — ${observationRead.observation.summary}\n`;
+            else if (observationRead.kind === "invalid")
+              wakeMessage += "Outcome: mismatch — observation was invalid or unsafe\n";
             if (lastLine) wakeMessage += `Last output: ${lastLine}\n`;
             if (digestBlock) {
               wakeMessage += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
@@ -2678,8 +2928,8 @@ export default function (pi: ExtensionAPI) {
           if (rec.ctx.hasUI) {
             const toastLabel = (rec.name ?? command).slice(0, 50);
             rec.ctx.ui.notify(
-              `${exitEmoji} ${toastLabel} → exit ${exitStr}`,
-              exitCode === 0 ? "info" : "error",
+              `${exitEmoji} ${toastLabel} → ${verdict} (exit ${exitStr})`,
+              verdictIsFailure(verdict) ? "error" : "info",
             );
           }
 
@@ -2701,7 +2951,11 @@ export default function (pi: ExtensionAPI) {
         if (name) startedLines.push(`  name: ${name}`);
         if (type) startedLines.push(`  type: ${type}`);
         startedLines.push(...typedStatusLines(metadata));
-        startedLines.push(`  wake: ${wake}`, `  log: ${logPath}`);
+        startedLines.push(
+          `  wake: ${wake}`,
+          `  log: ${logPath}`,
+          `  observation: ${observationPath}`,
+        );
         if (wake === "always")
           startedLines.push("  You'll be woken when it finishes.");
         else if (wake === "failure")
@@ -2712,7 +2966,16 @@ export default function (pi: ExtensionAPI) {
           );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],
-          details: { id, name, type, metadata, wake, logPath, pid: childPid },
+          details: {
+            id,
+            name,
+            type,
+            metadata,
+            observationPath,
+            wake,
+            logPath,
+            pid: childPid,
+          },
         };
       } finally {
         if (logFd !== undefined) closeSync(logFd);
@@ -3478,6 +3741,8 @@ export default function (pi: ExtensionAPI) {
         if (rec.name) lines.push(`  name: ${rec.name}`);
         if (rec.type) lines.push(`  type: ${rec.type}`);
         lines.push(...typedStatusLines(rec.metadata));
+        const observed = observationStatusLines(rec.observationPath, exit);
+        lines.push(...observed.lines);
         lines.push(`  wake: ${rec.wake}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
         return {
@@ -3490,6 +3755,11 @@ export default function (pi: ExtensionAPI) {
             name: rec.name,
             type: rec.type,
             metadata: rec.metadata,
+            observationPath: rec.observationPath,
+            ...(observed.read.kind === "ok"
+              ? { observation: observed.read.observation }
+              : {}),
+            verdict: observed.verdict,
             wake: rec.wake,
             recovered: false,
           },
@@ -3826,10 +4096,10 @@ export default function (pi: ExtensionAPI) {
       type: Type.Optional(
         Type.String({ description: "run: digest scorecard type" }),
       ),
-      kind: Type.Optional(Type.String({ description: "run: typed-workflow kind, such as maos.eval" })),
-      runId: Type.Optional(Type.String({ description: "run: typed-workflow run identifier" })),
-      statePath: Type.Optional(Type.String({ description: "run: typed-workflow state JSON path" })),
-      summaryPath: Type.Optional(Type.String({ description: "run: typed-workflow summary path" })),
+      kind: Type.Optional(Type.String({ description: "run: deprecated typed-workflow kind" })),
+      runId: Type.Optional(Type.String({ description: "run: deprecated typed-workflow run id" })),
+      statePath: Type.Optional(Type.String({ description: "run: deprecated typed-workflow state path" })),
+      summaryPath: Type.Optional(Type.String({ description: "run: deprecated typed-workflow summary path" })),
       wake: Type.Optional(
         Type.Union(
           ["never", "failure", "always"].map((value) => Type.Literal(value)),
@@ -4099,7 +4369,7 @@ export default function (pi: ExtensionAPI) {
     "  /job grep <id> <pattern>",
     "  /job cancel <id>",
     "  /job clean [days] [--all]",
-    "  /job run --wake <never|failure|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>",
+    "  /job run --wake <never|failure|always> [--name <name>] -- <command>",
   ].join("\n");
 
   pi.registerCommand("job", {
@@ -4177,7 +4447,7 @@ export default function (pi: ExtensionAPI) {
             const separator = rest.match(/(?:^|\s)--(?:\s|$)/);
             if (!separator)
               throw new Error(
-                "Usage: /job run --wake <never|failure|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>",
+                "Usage: /job run --wake <never|failure|always> [--name <name>] -- <command>",
               );
             const options = rest.slice(0, separator.index).trim().split(/\s+/).filter(Boolean);
             const command = rest
