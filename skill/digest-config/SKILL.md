@@ -6,7 +6,7 @@ description: Set up the pi-bgrun digest scorecard for this project. Use when the
 # Configure a project digest scorecard
 
 Goal: a `digest` section in `<project>/.pi/pi-bgrun.json` whose command turns a
-job log into a short pass/fail scorecard, appended to every `bgrun` wake as
+job log into a short pass/fail scorecard, appended to every background `job` wake as
 `digest (<label>): ...`. The scorecard must be reliable on both green and red
 logs — a wrong scorecard is worse than none. Most projects run more than one
 kind of job (unit tests, a build, e2e); configure one entry per job type rather
@@ -36,9 +36,9 @@ both `preset` and `command` are set within one entry, the preset wins:
 ```
 
 Prefer a `type` on each entry: it is matched exactly (case-insensitive) against
-the `type:` the agent passes to `bgrun`, so it does not depend on job names or
+the `type:` the agent passes to `job` action `run`, so it does not depend on job names or
 command lines staying stable. When you configure a `type`, tell the agent to
-pass it: `bgrun(command: …, name: …, type: "test")`. If a job's `type`/name
+pass it: `job(action: "run", command: …, name: …, type: "test")`. If a job's `type`/name
 selects no entry, pi-bgrun logs a one-line diagnostic naming the job and the
 configured types — check it when a scorecard is expected but absent.
 
@@ -81,10 +81,10 @@ advisory; a preset entry with no `type` still applies to every job.
    otherwise to the machine-global `~/.pi-bgrun/jobs`. An explicit `jobsDir`
    (any config layer) or `PI_BGRUN_DIR` overrides it; `PI_BGRUN_GLOBAL_DIR`
    retargets the machine-global base. The resolved path is printed as
-   `log: <path>` by `bgrun` and by `bgstatus <id>` — read it back there if
+   `log: <path>` by `job` action `run` and `job` action `status` — read it back there if
    unsure. List the `*.log` files of finished jobs.
 2. **Sample the formats across job types.** Group the logs by job type using
-   each job's `name` and command line (from `bgstatus`); most projects have at
+   each job's `name` and command line (from `job` action `status`); most projects have at
    least a test job and a build job. Pick 2-3 logs per type — at least one
    green and one red run each — and inspect them with `ctx_execute_file`
    (context-mode sandbox, so only your printed summary enters context).
@@ -109,8 +109,8 @@ advisory; a preset entry with no `type` still applies to every job.
    entry the `type` you identified in step 2, and putting the no-`match`
    default entry **last**. Use `match.name` / `match.command` globs only for
    jobs that will not pass a `type`. Create the file if absent. Tell the user
-   (or the agent driving `bgrun`) which `type:` value to pass for each job.
-7. **Smoke-test each entry.** Start a real `bgrun` job of each configured type
+   (or the agent driving `job`) which `type:` value to pass for each job.
+7. **Smoke-test each entry.** Start a real `job` action `run` of each configured type
    (e.g. the test command AND the build command), passing the matching
    `type:`, and check that its wake carries a correct `digest (<label>):` block
    for the right entry. If a block is empty, wrong, or comes from the wrong
