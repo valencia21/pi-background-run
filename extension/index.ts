@@ -28,8 +28,10 @@
 
 import {
   CONFIG_DIR_NAME,
+  keyHint,
   type ExtensionAPI,
   type ExtensionContext,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -1440,6 +1442,12 @@ interface BgStatusDetails {
   recovered?: boolean;
 }
 
+function defineTool(
+  tool: ToolDefinition<any, any, any>,
+): ToolDefinition<any, any, any> {
+  return tool;
+}
+
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, JobRecord>();
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
@@ -2109,7 +2117,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── bgrun tool ────────────────────────────────────────────────────────────
 
-  pi.registerTool({
+  const bgrunTool = defineTool({
     name: "bgrun",
     label: "Run in Background",
     description:
@@ -2160,7 +2168,13 @@ export default function (pi: ExtensionAPI) {
         ),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(
+      _toolCallId: string,
+      params: { command: string; name?: string; type?: string; wake?: WakePolicy },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ) {
       const {
         command,
         name: rawName,
@@ -2537,6 +2551,7 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+  pi.registerTool(bgrunTool);
 
   // ── Log condenser: ANSI strip, per-line cap, collapse runs, total budget ────
   // Keeps bgtail output small enough that a "quick peek" never floods context:
@@ -2977,7 +2992,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  pi.registerTool({
+  const bgtailTool = defineTool({
     name: "bgtail",
     label: "Tail Background Log",
     description:
@@ -3007,10 +3022,17 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(
+      _toolCallId: string,
+      params: { id: string; lines?: number; raw?: boolean; bytes?: number },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ) {
       return bgtailCore(params, ctx);
     },
   });
+  pi.registerTool(bgtailTool);
 
   // ── bggrep: pattern search over a job's log, capped for context ───────────
   //
@@ -3201,7 +3223,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  pi.registerTool({
+  const bggrepTool = defineTool({
     name: "bggrep",
     label: "Grep Background Log",
     description:
@@ -3237,10 +3259,17 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(
+      _toolCallId: string,
+      params: { id: string; pattern?: string; context?: number; bytes?: number },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ) {
       return bggrepCore(params, ctx);
     },
   });
+  pi.registerTool(bggrepTool);
 
   // ── bgstatus: list jobs (in-memory while alive; dir scan after restart) ─────
 
@@ -3392,7 +3421,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  pi.registerTool({
+  const bgstatusTool = defineTool({
     name: "bgstatus",
     label: "Background Job Status",
     description:
@@ -3412,10 +3441,17 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(
+      _toolCallId: string,
+      params: { id?: string; includeDone?: boolean },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ) {
       return bgstatusCore(params, ctx);
     },
   });
+  pi.registerTool(bgstatusTool);
 
   // ── bgclean: remove old job logs ───────────────────────────────────────────
 
@@ -3476,7 +3512,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  pi.registerTool({
+  const bgcleanTool = defineTool({
     name: "bgclean",
     label: "Clean Old Background Jobs",
     description:
@@ -3501,8 +3537,258 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(
+      _toolCallId: string,
+      params: { days?: number; all?: boolean },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ) {
       return bgcleanCore(params, ctx);
+    },
+  });
+  pi.registerTool(bgcleanTool);
+
+  // ── Unified job tool: the compact default surface ─────────────────────────
+
+  async function cancelJobCore(
+    params: { id: string },
+    ctx: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: { id: string; state: string; pid?: number };
+    isError?: boolean;
+  }> {
+    const { id } = params;
+    if (!id) throw new Error("job cancel: id is required");
+    validateJobId(id, "job cancel");
+    const rec = jobs.get(id);
+    const cfg = resolveConfig(ctx);
+    const logPath = rec?.logPath ?? join(cfg.jobsDir, `${id}.log`);
+    if (!rec && !existsSync(logPath)) {
+      return {
+        content: [{ type: "text", text: `No job found with id ${id}` }],
+        details: { id, state: "unknown" },
+        isError: true,
+      };
+    }
+    const existingExit = rec?.exitCode ?? parseExitFromLogPath(logPath);
+    if (existingExit !== undefined && existingExit !== null) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id}: already done (exit ${existingExit})`,
+          },
+        ],
+        details: { id, state: "done", pid: rec?.pid },
+      };
+    }
+    const pid = rec?.pid ?? pidFromId(id);
+    if (pid === null || pid <= 0) {
+      return {
+        content: [{ type: "text", text: `${id}: no cancellable process id` }],
+        details: { id, state: "unknown" },
+        isError: true,
+      };
+    }
+    // Cancellation is user/agent initiated and must not generate a completion
+    // wake. The normal exit handler still persists the terminal state and
+    // updates the human toast/widget.
+    if (rec) rec.wake = "never";
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch (groupError) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (pidError) {
+        const message =
+          pidError instanceof Error
+            ? pidError.message
+            : groupError instanceof Error
+              ? groupError.message
+              : "process is not running";
+        return {
+          content: [
+            { type: "text", text: `${id}: cancellation failed: ${message}` },
+          ],
+          details: { id, state: "unknown", pid },
+          isError: true,
+        };
+      }
+    }
+    updateWidget(ctx);
+    return {
+      content: [
+        { type: "text", text: `${id}: cancellation requested (SIGTERM)` },
+      ],
+      details: { id, state: "cancelling", pid },
+    };
+  }
+
+  pi.registerTool({
+    name: "job",
+    label: "Background Job",
+    description:
+      "Control genuinely asynchronous commands through one compact interface: run, status, tail, grep, cancel, or clean. Use foreground bash by default; use job only when work must outlive the current turn or run concurrently.",
+    promptSnippet:
+      "Run, inspect, cancel, and clean genuinely asynchronous background jobs",
+    promptGuidelines: [
+      "Default to foreground bash. Use job action=run only for deployment/CI monitoring, long evals, sustained observability, or work that must continue concurrently.",
+      "For job action=run, choose wake=always when continuation depends on completion, wake=failure when only failure needs attention, or wake=never for independent work.",
+      "After starting a job, continue other work; do not poll it through model turns.",
+      "Use job action=tail for a bounded recent view and action=grep for targeted failure or status evidence; never read a whole background log through bash or read.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union(
+        ["run", "status", "tail", "grep", "cancel", "clean"].map((value) =>
+          Type.Literal(value),
+        ),
+        { description: "Job operation" },
+      ),
+      command: Type.Optional(
+        Type.String({ description: "run: shell command to execute" }),
+      ),
+      id: Type.Optional(
+        Type.String({ description: "status/tail/grep/cancel: job id" }),
+      ),
+      name: Type.Optional(Type.String({ description: "run: short job label" })),
+      type: Type.Optional(
+        Type.String({ description: "run: digest scorecard type" }),
+      ),
+      wake: Type.Optional(
+        Type.Union(
+          ["never", "failure", "always"].map((value) => Type.Literal(value)),
+          { description: "run: completion wake policy" },
+        ),
+      ),
+      lines: Type.Optional(
+        Type.Number({ minimum: 1, description: "tail: newest line count" }),
+      ),
+      raw: Type.Optional(
+        Type.Boolean({ description: "tail: disable output condensation" }),
+      ),
+      pattern: Type.Optional(
+        Type.String({ description: "grep: regular expression" }),
+      ),
+      context: Type.Optional(
+        Type.Number({ minimum: 0, description: "grep: context lines" }),
+      ),
+      bytes: Type.Optional(
+        Type.Number({ minimum: 1, description: "tail/grep: scan window bytes" }),
+      ),
+      includeDone: Type.Optional(
+        Type.Boolean({ description: "status: include completed jobs" }),
+      ),
+      days: Type.Optional(
+        Type.Number({ minimum: 0, description: "clean: retention days" }),
+      ),
+      all: Type.Optional(
+        Type.Boolean({ description: "clean: include all sessions" }),
+      ),
+    }),
+    renderCall(args, theme) {
+      const target =
+        args.name || args.id || (args.command ? String(args.command) : "");
+      const compact = String(target).replace(/\s+/g, " ").trim();
+      const suffix = compact
+        ? ` ${compact.length > 110 ? `${compact.slice(0, 107)}…` : compact}`
+        : "";
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold(`job ${args.action || "…"}`))}${theme.fg("muted", suffix)}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      const text = result.content
+        .filter((part) => part.type === "text")
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("\n")
+        .trimEnd();
+      if (expanded) {
+        return new Text(
+          text
+            ? `\n${text
+                .split("\n")
+                .map((line) => theme.fg("toolOutput", line))
+                .join("\n")}`
+            : "",
+          0,
+          0,
+        );
+      }
+      if (isPartial) return new Text(theme.fg("muted", "… working"), 0, 0);
+      const details = (result.details ?? {}) as Record<string, unknown>;
+      const action = String((context.args as { action?: string })?.action || "job");
+      let summary = "✓ done";
+      if (action === "run" && details.id) summary = `✓ started ${details.id}`;
+      else if (action === "tail")
+        summary = `✓ ${details.newLines ?? details.linesShown ?? 0} lines`;
+      else if (action === "grep") summary = `✓ ${details.matches ?? 0} matches`;
+      else if (action === "status")
+        summary = details.state
+          ? `✓ ${details.state}${details.exitCode === undefined ? "" : ` · exit ${details.exitCode}`}`
+          : `✓ ${details.count ?? 0} jobs`;
+      else if (action === "cancel") summary = `✓ ${details.state ?? "cancelling"}`;
+      else if (action === "clean") summary = `✓ removed ${details.removed ?? 0}`;
+      return new Text(
+        `${theme.fg("success", summary)}${text ? theme.fg("muted", ` · ${keyHint("app.tools.expand", "expand")}`) : ""}`,
+        0,
+        0,
+      );
+    },
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      switch (params.action) {
+        case "run":
+          if (!params.command) throw new Error("job run: command is required");
+          return bgrunTool.execute(
+            toolCallId,
+            {
+              command: params.command,
+              name: params.name,
+              type: params.type,
+              wake: params.wake,
+            },
+            signal,
+            onUpdate,
+            ctx,
+          );
+        case "status":
+          return bgstatusCore(
+            { id: params.id, includeDone: params.includeDone },
+            ctx,
+          );
+        case "tail":
+          if (!params.id) throw new Error("job tail: id is required");
+          return bgtailCore(
+            {
+              id: params.id,
+              lines: params.lines,
+              raw: params.raw,
+              bytes: params.bytes,
+            },
+            ctx,
+          );
+        case "grep":
+          if (!params.id) throw new Error("job grep: id is required");
+          return bggrepCore(
+            {
+              id: params.id,
+              pattern: params.pattern,
+              context: params.context,
+              bytes: params.bytes,
+            },
+            ctx,
+          );
+        case "cancel":
+          if (!params.id) throw new Error("job cancel: id is required");
+          return cancelJobCore({ id: params.id }, ctx);
+        case "clean":
+          return bgcleanCore({ days: params.days, all: params.all }, ctx);
+        default:
+          throw new Error(`job: unsupported action ${String(params.action)}`);
+      }
     },
   });
 

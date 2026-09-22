@@ -355,6 +355,99 @@ function waitForWakes(
   });
 }
 
+test("job: unified tool dispatches run, status, tail, and grep", async () => {
+  await withJobsDir(async (_dir, { tools, ctx }) => {
+    const job = tools.get("job")!;
+    assert.ok(job, "unified job tool is registered");
+    for (const legacy of ["bgrun", "bgtail", "bggrep", "bgstatus", "bgclean"]) {
+      assert.ok(tools.has(legacy), `${legacy} remains registered for compatibility`);
+    }
+
+    const started = await job.execute(
+      "job-run",
+      { action: "run", command: "printf 'needle\\n'", wake: "never" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = started.details.id as string;
+    assert.ok(id);
+    await waitForLogExit(started.details.logPath);
+
+    const status = await job.execute(
+      "job-status",
+      { action: "status", id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(status.details.state, "done");
+    assert.equal(status.details.exitCode, 0);
+
+    const tail = await job.execute(
+      "job-tail",
+      { action: "tail", id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(tail.content[0].text, /needle/);
+
+    const grep = await job.execute(
+      "job-grep",
+      { action: "grep", id, pattern: "needle" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(grep.details.matches, 1);
+  });
+});
+
+test("job: cancel terminates a running process without a completion wake", async () => {
+  await withJobsDir(async (_dir, { tools, ctx, wakes }) => {
+    const job = tools.get("job")!;
+    const started = await job.execute(
+      "job-run-cancel",
+      { action: "run", command: "sleep 30", wake: "always" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = started.details.id as string;
+    const cancelled = await job.execute(
+      "job-cancel",
+      { action: "cancel", id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(cancelled.details.state, "cancelling");
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 4000) {
+      const status = await job.execute(
+        "job-cancel-status",
+        { action: "status", id },
+        undefined,
+        undefined,
+        ctx,
+      );
+      if (status.details.state === "done") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const final = await job.execute(
+      "job-cancel-final",
+      { action: "status", id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(final.details.state, "done");
+    assert.equal(wakes.length, 0);
+  });
+});
+
 test("bgrun: exit marker survives commands with # and explicit exit codes", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;

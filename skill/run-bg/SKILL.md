@@ -8,168 +8,82 @@ description: Use for genuinely asynchronous shell work such as deployment or CI 
 
 # Run in Background (pi-bgrun)
 
-Run genuinely asynchronous commands detached. Output → file and the session stays
-unblocked. Human toast/widget updates always happen; the `wake` policy decides whether
-completion also injects a model turn. Never poll through model turns.
+Run genuinely asynchronous commands detached through the unified `job` tool. Output goes
+to a bounded log while the session stays unblocked. Human toast/widget updates always
+happen; `wake` controls whether completion also injects a model turn. Never poll through
+model turns.
 
 ## When to use
 
 - Deployment, CI, or merge-queue monitoring that must trigger follow-up work.
-- Long evals, sustained observability, installs, or integration suites that need to run while other work continues.
+- Long evals, sustained observability, installs, or integration suites that must run while other work continues.
 - Independent long-running work whose output should stay on disk.
 
-## When NOT to use
+## When not to use
 
-- Do not select bgrun merely because a command is a test, build, lint, database query, or external request.
-- Default to foreground execution for routine and focused checks. Reassess after a fast or fail-fast result.
-- For verbose but quick commands, redirect raw output to a file and print a bounded summary instead of creating a background lifecycle.
-- Interactive commands (prompts, REPL, SSH) — bgrun detaches from the terminal.
+- Do not select `job` merely because a command is a test, build, lint, database query, or external request.
+- Default to foreground `bash` for routine and focused checks. Reassess after a fast or fail-fast result.
+- For verbose but quick commands, redirect raw output to a file and print a bounded summary.
+- Interactive commands (prompts, REPL, SSH): background jobs detach from the terminal.
 
-## Tools
+## Operations
 
-| Action | Tool |
+| Action | Call |
 |---|---|
-| Start  | `bgrun(command: "gh run watch …", name: "deploy-monitor", wake: "always")` → `started: <job-id>` (`wake` is `never`, `failure`, or `always`) |
-| Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
-| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
-| Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
-| Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
+| Start | `job(action: "run", command: "gh run watch …", name: "deploy-monitor", wake: "always")` |
+| Status | `job(action: "status", id: "<job-id>")`; omit `id` to list this session; use `includeDone: true` for completed jobs |
+| Tail | `job(action: "tail", id: "<job-id>", lines: 40)` — first read returns the tail; repeats return only appended lines |
+| Grep | `job(action: "grep", id: "<job-id>", pattern: "failure", context: 2)` — bounded, line-numbered matches |
+| Cancel | `job(action: "cancel", id: "<job-id>")` — sends SIGTERM to the detached process group and suppresses a completion wake |
+| Clean | `job(action: "clean", days: 7)`; add `all: true` to include every session |
+
+The legacy `bgrun`, `bgstatus`, `bgtail`, `bggrep`, and `bgclean` names remain registered
+for old transcripts, but normal sessions expose only `job`.
 
 ## Workflow
 
-1. **Start:** call `bgrun` with the command, a short `name`, and an intentional wake policy:
-   - `wake: "always"` when continuation depends on completion (deploy/eval monitors);
+1. **Start** with a short `name` and intentional wake policy:
+   - `wake: "always"` when continuation depends on completion;
    - `wake: "failure"` when success needs no model turn;
    - `wake: "never"` for independent work.
-   When the project's digest config defines `type` entries, also pass the
-   matching `type`; a digest is useful only for jobs that wake. Note the returned
-   job-id and continue other work.
-2. **On wake (if requested):** check the exit status in the wake message first.
-   - `exit: 0` → success. `bgtail` to confirm.
-   - `exit: <non-zero>` → failure. Analyze the log (see below).
-3. **If you need to check before the wake (non-blocking):** call `bgstatus` with the job id.
-   - `running` → keep doing other work. Do NOT spin a wait loop.
-   - `done exit=0` → success.
-   - `done exit=<non-zero>` → failure; analyze the log.
-   - `running` but the job should have finished long ago → likely crashed (the
-     process died without writing the exit marker). Analyze the log with
-     `bggrep` (any jobs dir, last 2 MB) or `ctx_execute_file` on the absolute path
-     (whole file — needed for logs bigger than 2 MB).
+   When the project's digest config defines `type` entries, pass the matching `type`.
+   Record the returned id and continue other work.
+2. **On wake**, trust the exit status first. A configured `digest (<label>):` block is a
+   short project-specific scorecard and often answers what failed.
+3. **Inspect only when needed**:
+   - use `action: "status"` for state;
+   - use `action: "tail"` for a positional peek;
+   - use `action: "grep"` with an explicit pattern for targeted evidence.
+4. **Cancel explicitly** with `action: "cancel"`; never reconstruct the pid and hand-roll
+   a kill command.
 
-### Reading results without flooding context
+## Reading results without flooding context
 
-If the wake message carries a `digest (<label>):` block (the label is the
-entry's `label`, its type, a matched `match.name`, or the preset id /
-`command`), read that
-first — it is a short pass/fail scorecard configured for this project and
-usually answers "what failed" without any follow-up read. `bgtail` stays the
-positional-peek tool for everything else.
+- `tail` strips ANSI and wrapper markers, collapses repeats, truncates long lines, and caps
+  total returned output. Repeat reads use delta tailing.
+- `grep` searches the last 2 MiB by default, pre-truncates each line, caps matches/output,
+  and runs caller regexes under a wall-clock budget. Increase `bytes` only when needed.
+- Never `cat`, `Read`, `bash cat`, or `bash grep` a full job log. Prefer `tail`, then
+  `grep`. For a whole project-local log, use a sandboxed file-analysis tool that prints
+  only bounded aggregates—not raw content.
+- A log that hit `maxLogBytes` keeps its first bytes and reports truncation. Missing tail
+  output and digest results are then unknown; do not interpret them as success.
 
-- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
-- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (`ctx_execute_file` can read the same file given its absolute path.) Searches the last 2 MiB by default; `bytes: 67108864` widens it to the whole capped log — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
-- **Whole-log failure analysis:** `ctx_execute_file` on the log's **absolute
-  path**. Unlike `bgtail`/`bggrep` (bounded to the last 2 MB), this reads the
-  whole file — the only way to cover a log bigger than 2 MB, e.g. one that hit
-  the size ceiling. Copy the `log:` path from `bgrun`'s `started:` line and
-  expand `~` yourself (it is not expanded for you; the tool takes an absolute
-  path or one relative to the project root). Otherwise it is an ordinary tool
-  call: your normal Read-deny rules still apply.
+## Restart and scope
 
-  ```javascript
-  ctx_execute_file(
-    path: "/Users/me/project/.pi-bgrun/jobs/<JOB>.log",
-    language: "javascript",
-    code: "const L=FILE_CONTENT.split('\\n'); \
-           const fails=L.filter(l=>/(--- FAIL|FAIL|panic:|Error:)/.test(l)); \
-           console.log(`lines: ${L.length}, failures: ${fails.length}`); \
-           console.log(fails.slice(0,40).join('\\n'));"
-  })
-  ```
-
-  A 10 000-line `make test` log collapses to a ~30-line summary in context.
-
-**Why `bggrep` instead of `bash grep` on the log?**
-
-- `bash grep` output is uncapped — a retry-storm log can dump thousands of
-  matching lines (megabytes) straight into context, and staying safe depends
-  on remembering `| head` on every single call. `bggrep` is bounded by design
-  (last 2 MB of the log, per-line 10 000-char pre-truncation, ~50 matches,
-  ~8KB, plus a wall-clock match budget so a runaway regex errors instead of
-  hanging).
-- It takes the job id — no log-path reconstruction, no shell-quoting of the
-  regex, and no reliance on the agent getting `~` expansion right.
-- Output is self-describing: match count, line numbers, `…[N skipped]…` gap
-  markers, `— none` for no-match.
-
-Plain `grep` via bash is fine only for a one-off search you know is tiny.
-
-**Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
-`bgtail`, `bggrep`, or (for project-local logs) `ctx_execute_file`.
-
-**Order of preference, cheapest first: `bgtail` → `bggrep` → `ctx_execute_file`.**
-Reach for the sandbox only when you need something a regex over lines cannot
-express — totals, dedup, grouping, joining the log against another file.
-
-`ctx_execute_file` is not itself a context dump: the file's bytes never enter
-context, only your script's **stdout** does ("raw content never leaves"). So the
-cost is exactly what you print — which makes `console.log(FILE_CONTENT)` (or
-`print(open(path).read())`, or a big unbounded slice) the one way a whole-log
-analysis turns into a context dump, and a capped-by-default 64 MiB log makes
-that expensive rather than merely rude. Aggregate, then cap what you print:
-
-- print counts / grouped summaries / the first N matches — not the content;
-- keep a `.slice(0, 40)` / `[:40]` on anything you echo;
-- for many different questions about one big log, index it once (`ctx_index`)
-  and `ctx_search` it, instead of re-scanning the file per call;
-- `bgtail` with a larger `lines`, or a tighter `bggrep` pattern, is usually the
-  cheaper answer to "I need to see more".
-
-## After a pi restart or session switch
-
-- The live wake does not survive a pi restart or a `/resume` to a different session
-  (the extension loses the child process handle). The log still completes on disk.
-- After a restart/switch, run `bgstatus(<job-id>)` — the id still resolves via the
-  log's `__BGRUN_EXIT__=N` marker. To browse everything on disk, use
-  `bgstatus(includeDone: true)`.
-- Each session only tracks its own jobs by default. Running jobs from other
-  sessions appear only when `adoptForeignJobs` is enabled in
-  `~/.pi/agent/pi-bgrun.json` (or `PI_BGRUN_FOREIGN_JOBS=1`); finished foreign
-  logs appear with `bgstatus(includeDone: true)` regardless.
+- A detached process and its log survive Pi restart, but its live wake handler does not.
+  Recover state with `job(action: "status", id: "<job-id>")`.
+- Each session tracks its own jobs by default. `adoptForeignJobs` can surface running jobs
+  from other sessions; `includeDone: true` can list finished logs.
+- Logs default to `<project>/.pi-bgrun/jobs` and are excluded through `.git/info/exclude`.
+  The machine-global `~/.pi-bgrun/jobs` path is a deprecated fallback outside projects.
+- Cleanup is session-scoped unless `all: true`; running jobs are never removed.
 
 ## Rules
 
-- Call the tools; never hand-roll `nohup … &` inline.
-- One job = one id. Multiple concurrent jobs are fine — each has its own log.
-- Job logs are capped by default (`maxLogBytes` / `PI_BGRUN_MAX_LOG_BYTES`,
-  64 MiB; `0` = unlimited) and the cap keeps the **first** bytes. A log that
-  ends with `__BGRUN_TRUNC__ output truncated: kept the first <N> bytes` (or
-  `__BGRUN_NOCAP__ log ceiling unavailable`, when the ceiling could not be
-  installed and the job ran uncapped) hit that ceiling: output past it was dropped, not lost to a failure — the job
-  still ran to completion with its real exit code, and readers (`bgtail`,
-  `bggrep`, the wake's line count/last line) filter the notice out. The wake's
-  Stats line, `bgtail` and `bggrep` all say when a log was capped (and report
-  `truncatedAtBytes` in their details), and a configured digest scorecard is
-  skipped rather than scored against an incomplete log — so on a capped job,
-  read a missing digest as "unknown", **not** as "no failures", and do not
-  re-run the command to see the missing tail; raise the ceiling if you need the
-  whole log. The flag lives in the exit marker (`__BGRUN_EXIT__=0
-  truncated=<N>`, or `nocap=1`), never in printable text — the `__BGRUN_*__`
-  lines are reserved, so a notice-looking line printed by the command itself is
-  content, not a signal. A search window is also limited to its last
-  500 000 lines: when that bites, `bgtail`/`bggrep` say so — a "none" from a
-  trimmed window means the head was not searched.
-- Logs default to `<project>/.pi-bgrun/jobs` in a repo — project-scoped is the
-  model (`~/.pi-bgrun/jobs` is a deprecated fallback for a cwd with no project
-  root; an absolute `PI_BGRUN_DIR`/`jobsDir` still works but is legacy). Project-local dirs are
-  auto-ignored via `.git/info/exclude`, which keeps `git status` clean; the
-  logs stay reachable for project-sandboxed analysis tools like
-  `ctx_execute_file` because they live inside the project.
-- Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
-  sweeps every session's. Auto-sweeps at session start/shutdown are
-  session-scoped plus an orphan pass (default on — removes finished week-old
-  logs from crashed/abandoned sessions; disable with `globalAutoClean: false`
-  / `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`). Under the project-local default the orphan
-  pass covers the current project's jobs dir AND the machine-global
-  `~/.pi-bgrun/jobs`; an explicit absolute `jobsDir` is swept alone. Retention
-  is `cleanupDays` (default 7, configurable).
-- To stop a running job, use `bash` with `kill -- -<pid>` (process group — required because the child is spawned detached). The pid is the last `--`-separated segment of the job id; it is not shown as a separate field in `bgstatus` output. There is no `bgkill` tool.
+- Call `job`; never hand-roll `nohup … &`.
+- One run produces one id and one bounded log.
+- Give every run a recognizable `name`.
+- Choose `wake` deliberately.
+- Continue useful work after launch; do not poll through turns.
+- Treat logs as sensitive and return only the evidence required for the task.

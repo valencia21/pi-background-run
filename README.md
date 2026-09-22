@@ -34,11 +34,14 @@ Restart pi after install so the extension loads.
 
 | Tool | Purpose |
 | ------ | --------- |
-| `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. `wake` selects `never`, `failure`, or `always` model-turn delivery. Returns `started: <job-id>` immediately. |
+| `job` | Unified compact interface with `run`, `status`, `tail`, `grep`, `cancel`, and `clean` actions. This is the recommended normal prompt surface. Cancellation sends SIGTERM to the detached process group and suppresses a completion wake. |
+| `bgrun` | Compatibility tool for launching a detached command. Optional `name` gives the job a short human-readable label. `wake` selects `never`, `failure`, or `always` model-turn delivery. Returns `started: <job-id>` immediately. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
 | `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
+
+The five `bg*` tools remain registered so saved transcripts and existing integrations keep working. A dynamic tool manager can hide them and expose only `job` without losing compatibility.
 
 ## Completion wake policy
 
@@ -51,8 +54,8 @@ Every job accepts `wake: "never" | "failure" | "always"`:
 Omitting `wake` uses `defaultWake` from layered configuration (`PI_BGRUN_WAKE`
 overrides it). The package default remains `always` for backward compatibility;
 users who want opt-in model turns can set `"defaultWake": "never"`. Per-job
-policy is persisted in transcript entries and displayed by `bgstatus` after a
-session reload.
+policy is persisted in transcript entries and displayed by `job(action: "status")`
+(or compatibility tool `bgstatus`) after a session reload.
 
 Use `always` for deployment/eval monitors whose completion requires immediate
 follow-up, `failure` for long checks whose successful completion needs no model
@@ -79,13 +82,13 @@ wake messages) is the agent's workflow.
 ## Roadmap / not provided
 
 - Deprecated: the machine-global jobs dir (`PI_BGRUN_GLOBAL_DIR`, `~/.pi-bgrun/jobs`) — see [deprecation](#deprecated-machine-global-jobs-dir). Supported until a future major.
-- `bgkill` — not implemented; to stop a running job, use `kill -- -<pid>` (kill the process group — the child is spawned detached). The pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
-- `bgwait` — not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
+- A separate `bgkill` tool is not provided; use `job(action: "cancel", id: "<job-id>")`.
+- `bgwait` is not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
 
 ## How it works
 
 ```text
-agent calls bgrun(command: "gh run watch …", name: "deploy-monitor", wake: "always")
+agent calls job(action: "run", command: "gh run watch …", name: "deploy-monitor", wake: "always")
   → extension resolves log path: <jobsDir>/<slug>-<ts>-<pid>.log (default <project>/.pi-bgrun/jobs/ in a repo, else ~/.pi-bgrun/jobs/)
   → spawn('sh', ['-c', <wrapper>, 'bgrun', '<cmd>'],
           { stdio: ['ignore', logFd, logFd], detached: true }).unref()
