@@ -5450,6 +5450,41 @@ test("bgrun: type and wake policy survive entry persistence and reconstruction",
   }
 });
 
+test("session_shutdown: detached completion is reconciled by the active session without stale callbacks", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { entries, wakes, tools, ctx, fireSessionShutdown } = h;
+    const bgrun = tools.get("bgrun")!;
+    const result = await bgrun.execute(
+      "reload-race",
+      { command: "sleep 0.15; echo after-reload", wake: "always" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (result.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    const logPath = join(dir, `${id}.log`);
+
+    await fireSessionShutdown();
+    await waitForLogExit(logPath);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    assert.equal(wakes.length, 0, "disposed generation did not wake the agent");
+    assert.equal(
+      entries.filter((entry) => entry.data?.id === id).length,
+      1,
+      "disposed generation persisted only the running entry",
+    );
+
+    const replacement = makeFakePi({ priorEntries: entries });
+    await loadExtension(replacement.pi);
+    await replacement.fireSessionStart();
+    const records = replacement.entries.filter((entry) => entry.data?.id === id);
+    assert.equal(records.length, 2, "active generation reconciled completion once");
+    assert.equal(records[1].data?.state, "done");
+    assert.equal(records[1].data?.exitCode, 0);
+  });
+});
+
 test("session_shutdown: sweeps this session's old logs and does not throw", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;

@@ -8,10 +8,11 @@ live agent always, only on failure, or never. Human toast and widget updates rem
 enabled for every policy.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
-shell runner and no external daemon — the extension spawns the job in-process,
-detects completion via the child `exit` event, and conditionally calls
-`pi.sendUserMessage` when the job's wake policy requests a model turn. The log
-file is self-describing (full output + a trailing
+shell runner and no external daemon — the extension spawns the job in-process
+and uses the child `exit` event while that extension generation remains active.
+On `/reload` or session shutdown it detaches generation-bound callbacks; the
+replacement extension reconciles completion from the self-describing log and
+never invokes stale Pi APIs. The log contains full output plus a trailing
 `__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
 exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
 is gone (reconstructed from a restart, or adopted from another session), and a
@@ -98,12 +99,17 @@ agent calls job(action: "run", command: "gh run watch …", name: "deploy-monito
   → records job in-memory + appends a bgrun-job entry to the session
   → returns "started: <job-id>"
 
-child 'exit' event fires:
+child 'exit' event fires while the same extension generation is active:
   → extension records exit code, appends a done entry
   → when the per-job wake policy matches the outcome, pi.sendUserMessage(wake)
      triggers a turn when idle or queues a follow-up when busy
   → ctx.ui.notify(...)  — toast for the human, regardless of wake policy
   → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
+
+/reload or session shutdown happens first:
+  → old generation invalidates itself and detaches child listeners
+  → detached process continues writing its log and exit marker
+  → active replacement generation reconstructs and persists completion once
 ```
 
 The child writes the log directly via its own stdout fd (no pipe to pi), so the job
