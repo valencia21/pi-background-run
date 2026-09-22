@@ -60,7 +60,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -1413,12 +1413,20 @@ export function formatDuration(ms: number): string {
   return `${m}:${String(rem).padStart(2, "0")}`;
 }
 
+interface JobMetadata {
+  kind: string;
+  runId?: string;
+  statePath?: string;
+  summaryPath?: string;
+}
+
 interface JobRecord {
   id: string;
   pid: number;
   cmd: string;
   name?: string; // optional human-readable label
   type?: string; // optional job type used for digest scorecard selection
+  metadata?: JobMetadata; // optional typed-workflow presentation metadata
   wake: WakePolicy; // whether completion injects a model turn
   started: number;
   logPath: string;
@@ -1440,6 +1448,7 @@ interface BgrunJobEntryData {
   cmd: string;
   name?: string;
   type?: string;
+  metadata?: JobMetadata;
   wake?: WakePolicy;
   started: number;
   logPath: string;
@@ -1455,6 +1464,7 @@ interface BgStatusDetails {
   cmd?: string;
   name?: string;
   type?: string;
+  metadata?: JobMetadata;
   wake?: WakePolicy;
   count?: number;
   recovered?: boolean;
@@ -1524,6 +1534,71 @@ export default function (pi: ExtensionAPI) {
   // bgrun param and the config `type` truncate identically (see MAX_TYPE_LEN).
   function sanitizeType(type: string | undefined): string | undefined {
     return normalizeType(type);
+  }
+
+  function metadataPath(raw: string | undefined, cwd: string): string | undefined {
+    const value = (raw ?? "").trim();
+    if (!value) return undefined;
+    if (value.includes("\0") || value.length > 4096)
+      throw new Error("job metadata path is invalid");
+    const expanded = value === "~"
+      ? homedir()
+      : value.startsWith("~/")
+        ? join(homedir(), value.slice(2))
+        : value;
+    return resolve(cwd, expanded);
+  }
+
+  function sanitizeMetadata(
+    input: {
+      kind?: string;
+      runId?: string;
+      statePath?: string;
+      summaryPath?: string;
+    },
+    cwd: string,
+  ): JobMetadata | undefined {
+    const rawKind = (input.kind ?? "").trim().toLowerCase();
+    const hasOther = Boolean(input.runId || input.statePath || input.summaryPath);
+    if (!rawKind) {
+      if (hasOther) throw new Error("job run: kind is required with typed metadata");
+      return undefined;
+    }
+    if (!/^[a-z0-9][a-z0-9._-]{0,79}$/.test(rawKind))
+      throw new Error("job run: kind must be 1-80 lowercase letters, digits, dots, underscores, or hyphens");
+    const runId = sanitizeName(input.runId);
+    return {
+      kind: rawKind,
+      ...(runId ? { runId } : {}),
+      ...(input.statePath ? { statePath: metadataPath(input.statePath, cwd) } : {}),
+      ...(input.summaryPath ? { summaryPath: metadataPath(input.summaryPath, cwd) } : {}),
+    };
+  }
+
+  function typedStatusLines(metadata: JobMetadata | undefined): string[] {
+    if (!metadata) return [];
+    const lines = [`  kind: ${metadata.kind}`];
+    if (metadata.runId) lines.push(`  run: ${metadata.runId}`);
+    if (metadata.kind === "maos.eval" && metadata.statePath) {
+      try {
+        const info = statSync(metadata.statePath);
+        if (!info.isFile() || info.size > 64 * 1024)
+          throw new Error("state file is not a bounded regular file");
+        const state = JSON.parse(readFileSync(metadata.statePath, "utf8")) as Record<string, unknown>;
+        const phase = typeof state.status === "string" ? state.status : undefined;
+        const mode = typeof state.mode === "string" ? state.mode : undefined;
+        const model = typeof state.model === "string" ? state.model : undefined;
+        const workspace = typeof state.workspace === "string" ? state.workspace : undefined;
+        if (phase) lines.push(`  eval phase: ${sanitizeName(phase)}`);
+        if (mode || model)
+          lines.push(`  eval profile: ${[mode, model].filter(Boolean).map(String).join(" · ")}`);
+        if (workspace) lines.push(`  eval workspace: ${workspace.slice(0, 4096)}`);
+      } catch {
+        lines.push(`  eval state: unavailable (${metadata.statePath})`);
+      }
+    }
+    if (metadata.summaryPath) lines.push(`  summary: ${metadata.summaryPath}`);
+    return lines;
   }
 
   // Count the log's total lines with a bounded-memory streaming scan (one
@@ -1919,6 +1994,7 @@ export default function (pi: ExtensionAPI) {
       cmd: rec.cmd,
       name: rec.name,
       type: rec.type,
+      metadata: rec.metadata,
       wake: rec.wake,
       started: rec.started,
       logPath: rec.logPath,
@@ -2007,7 +2083,7 @@ export default function (pi: ExtensionAPI) {
       const namePrefix = d.name ? `"${d.name}" ` : "";
       box.addChild(
         new Text(
-          `${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`,
+          `${icon} ${theme.fg("accent", d.metadata?.kind ?? "bgrun")} ${namePrefix}${d.id}${exitStr}`,
           0,
           0,
         ),
@@ -2078,6 +2154,7 @@ export default function (pi: ExtensionAPI) {
           cmd: d.cmd,
           name: d.name,
           type: d.type,
+          metadata: d.metadata,
           wake: d.wake ?? resolveConfig(ctx).defaultWake,
           started: d.started,
           logPath: d.logPath,
@@ -2203,6 +2280,10 @@ export default function (pi: ExtensionAPI) {
             "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
         }),
       ),
+      kind: Type.Optional(Type.String({ description: "Optional typed-workflow kind, such as maos.eval" })),
+      runId: Type.Optional(Type.String({ description: "Optional typed-workflow run identifier" })),
+      statePath: Type.Optional(Type.String({ description: "Optional typed-workflow state JSON path" })),
+      summaryPath: Type.Optional(Type.String({ description: "Optional typed-workflow summary artifact path" })),
       wake: Type.Optional(
         Type.Union(
           ["never", "failure", "always"].map((policy) =>
@@ -2218,7 +2299,16 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(
       _toolCallId: string,
-      params: { command: string; name?: string; type?: string; wake?: WakePolicy },
+      params: {
+        command: string;
+        name?: string;
+        type?: string;
+        kind?: string;
+        runId?: string;
+        statePath?: string;
+        summaryPath?: string;
+        wake?: WakePolicy;
+      },
       _signal: AbortSignal | undefined,
       _onUpdate: unknown,
       ctx: ExtensionContext,
@@ -2230,6 +2320,10 @@ export default function (pi: ExtensionAPI) {
         command,
         name: rawName,
         type: rawType,
+        kind,
+        runId,
+        statePath,
+        summaryPath,
         wake: rawWake,
       } = params;
       if (!command || !command.trim()) {
@@ -2237,6 +2331,10 @@ export default function (pi: ExtensionAPI) {
       }
       const name = sanitizeName(rawName);
       const type = sanitizeType(rawType);
+      const metadata = sanitizeMetadata(
+        { kind, runId, statePath, summaryPath },
+        ctx.cwd ?? process.cwd(),
+      );
 
       const cfg = resolveConfig(ctx);
       const wake = normalizeWakePolicy(rawWake) ?? cfg.defaultWake;
@@ -2329,6 +2427,7 @@ export default function (pi: ExtensionAPI) {
           cmd: command,
           name,
           type,
+          metadata,
           wake,
           started: Date.now(),
           logPath,
@@ -2344,6 +2443,7 @@ export default function (pi: ExtensionAPI) {
           cmd: command,
           name,
           type,
+          metadata,
           wake,
           started: Date.now(),
           logPath,
@@ -2374,6 +2474,7 @@ export default function (pi: ExtensionAPI) {
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
+            metadata: rec.metadata,
             wake: rec.wake,
             started: rec.started,
             logPath: rec.logPath,
@@ -2461,6 +2562,7 @@ export default function (pi: ExtensionAPI) {
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
+            metadata: rec.metadata,
             wake: rec.wake,
             started: rec.started,
             logPath,
@@ -2598,6 +2700,7 @@ export default function (pi: ExtensionAPI) {
         const startedLines = [`started: ${id}`];
         if (name) startedLines.push(`  name: ${name}`);
         if (type) startedLines.push(`  type: ${type}`);
+        startedLines.push(...typedStatusLines(metadata));
         startedLines.push(`  wake: ${wake}`, `  log: ${logPath}`);
         if (wake === "always")
           startedLines.push("  You'll be woken when it finishes.");
@@ -2609,7 +2712,7 @@ export default function (pi: ExtensionAPI) {
           );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],
-          details: { id, name, type, wake, logPath, pid: childPid },
+          details: { id, name, type, metadata, wake, logPath, pid: childPid },
         };
       } finally {
         if (logFd !== undefined) closeSync(logFd);
@@ -3374,6 +3477,7 @@ export default function (pi: ExtensionAPI) {
         const lines = [`${id}: ${state}${exitStr}`];
         if (rec.name) lines.push(`  name: ${rec.name}`);
         if (rec.type) lines.push(`  type: ${rec.type}`);
+        lines.push(...typedStatusLines(rec.metadata));
         lines.push(`  wake: ${rec.wake}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
         return {
@@ -3385,6 +3489,7 @@ export default function (pi: ExtensionAPI) {
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
+            metadata: rec.metadata,
             wake: rec.wake,
             recovered: false,
           },
@@ -3721,6 +3826,10 @@ export default function (pi: ExtensionAPI) {
       type: Type.Optional(
         Type.String({ description: "run: digest scorecard type" }),
       ),
+      kind: Type.Optional(Type.String({ description: "run: typed-workflow kind, such as maos.eval" })),
+      runId: Type.Optional(Type.String({ description: "run: typed-workflow run identifier" })),
+      statePath: Type.Optional(Type.String({ description: "run: typed-workflow state JSON path" })),
+      summaryPath: Type.Optional(Type.String({ description: "run: typed-workflow summary path" })),
       wake: Type.Optional(
         Type.Union(
           ["never", "failure", "always"].map((value) => Type.Literal(value)),
@@ -3813,6 +3922,10 @@ export default function (pi: ExtensionAPI) {
               command: params.command,
               name: params.name,
               type: params.type,
+              kind: params.kind,
+              runId: params.runId,
+              statePath: params.statePath,
+              summaryPath: params.summaryPath,
               wake: params.wake,
             },
             signal,
@@ -3986,7 +4099,7 @@ export default function (pi: ExtensionAPI) {
     "  /job grep <id> <pattern>",
     "  /job cancel <id>",
     "  /job clean [days] [--all]",
-    "  /job run --wake <never|failure|always> [--name <name>] -- <command>",
+    "  /job run --wake <never|failure|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>",
   ].join("\n");
 
   pi.registerCommand("job", {
@@ -4064,7 +4177,7 @@ export default function (pi: ExtensionAPI) {
             const separator = rest.match(/(?:^|\s)--(?:\s|$)/);
             if (!separator)
               throw new Error(
-                "Usage: /job run --wake <never|failure|always> [--name <name>] -- <command>",
+                "Usage: /job run --wake <never|failure|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>",
               );
             const options = rest.slice(0, separator.index).trim().split(/\s+/).filter(Boolean);
             const command = rest
@@ -4073,6 +4186,10 @@ export default function (pi: ExtensionAPI) {
             if (!command) throw new Error("job run: command is required after --");
             let wake: WakePolicy | undefined;
             let name: string | undefined;
+            let kind: string | undefined;
+            let runId: string | undefined;
+            let statePath: string | undefined;
+            let summaryPath: string | undefined;
             for (let i = 0; i < options.length; i++) {
               const token = options[i];
               if (token === "--wake") {
@@ -4083,6 +4200,18 @@ export default function (pi: ExtensionAPI) {
               } else if (token === "--name") {
                 name = options[++i];
                 if (!name) throw new Error("job run: --name requires a value");
+              } else if (token === "--kind") {
+                kind = options[++i];
+                if (!kind) throw new Error("job run: --kind requires a value");
+              } else if (token === "--run-id") {
+                runId = options[++i];
+                if (!runId) throw new Error("job run: --run-id requires a value");
+              } else if (token === "--state-path") {
+                statePath = options[++i];
+                if (!statePath) throw new Error("job run: --state-path requires a value");
+              } else if (token === "--summary-path") {
+                summaryPath = options[++i];
+                if (!summaryPath) throw new Error("job run: --summary-path requires a value");
               } else {
                 throw new Error(`job run: unknown option ${token}`);
               }
@@ -4091,7 +4220,7 @@ export default function (pi: ExtensionAPI) {
               throw new Error("job run: explicit --wake policy is required");
             result = await bgrunTool.execute(
               "slash-job-run",
-              { command, name, wake },
+              { command, name, kind, runId, statePath, summaryPath, wake },
               undefined,
               undefined,
               ctx,

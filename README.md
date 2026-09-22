@@ -64,6 +64,33 @@ turn, and `never` for independent work. Foreground execution remains the default
 for routine focused commands; do not choose background execution from command
 category alone.
 
+## Typed workflow metadata
+
+Jobs remain the only process supervisor. Domain workflows can optionally attach
+presentation metadata without changing spawn, cancellation, wake, or cleanup behavior:
+
+```ts
+job({
+  action: "run",
+  command: "node eval-worker.mjs …",
+  name: "eval-decision-quality",
+  kind: "maos.eval",
+  runId: "decision-quality",
+  statePath: "~/.cache/pi-maos-eval-workers/decision-quality/state.json",
+  summaryPath: "~/agent-interface/evals/2026-09-22-decision-quality.md",
+  wake: "always"
+})
+```
+
+`job status <id>` always shows generic process state. For `maos.eval`, it also
+reads a bounded (64 KiB maximum) regular JSON state file and renders only the
+whitelisted phase, mode, model, and workspace fields plus the summary path. It
+never renders arbitrary state keys. Unknown kinds retain generic rendering.
+Metadata persists in the session transcript across `/reload`.
+
+`type` remains reserved for digest scorecard selection; `kind` identifies the
+optional typed workflow.
+
 ## Slash commands
 
 `/job` mirrors the unified agent tool for direct use in the TUI. Results open
@@ -77,7 +104,7 @@ instead of disappearing in a notification.
 | `/job grep <id> <pattern>` | Search a job's bounded log window with a regular expression. |
 | `/job cancel <id>` | Send SIGTERM to the exact job's detached process group. |
 | `/job clean [days] [--all]` | Remove old logs, session-scoped unless `--all` is present. |
-| `/job run --wake <never\|failure\|always> [--name <name>] -- <command>` | Start a managed job with an explicit wake policy. |
+| `/job run --wake <never\|failure\|always> [--name <name>] [--kind <kind> --run-id <id> --state-path <path> --summary-path <path>] -- <command>` | Start a managed job with an explicit wake policy and optional typed-workflow metadata. |
 | `/job help` | Show command usage. |
 
 `/bgstatus`, `/bgtail`, and `/bgclean` remain compatibility aliases. There are

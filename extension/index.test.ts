@@ -414,6 +414,84 @@ test("job: unified tool dispatches run, status, tail, and grep", async () => {
   });
 });
 
+test("job: maos.eval metadata renders bounded structured state", async () => {
+  await withJobsDir(async (dir, { tools, ctx }) => {
+    const statePath = join(dir, "eval-state.json");
+    const summaryPath = join(dir, "eval-report.md");
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        status: "running",
+        mode: "heavy",
+        model: "fable",
+        workspace: "/tmp/eval-rift",
+        secret: "must-not-render",
+      }),
+    );
+    const job = tools.get("job")!;
+    const started = await job.execute(
+      "typed-job-run",
+      {
+        action: "run",
+        command: "printf 'eval-ok\\n'",
+        kind: "maos.eval",
+        runId: "decision-quality",
+        statePath,
+        summaryPath,
+        wake: "never",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = started.details.id as string;
+    assert.equal(started.details.metadata.kind, "maos.eval");
+    await waitForLogExit(started.details.logPath);
+
+    const status = await job.execute(
+      "typed-job-status",
+      { action: "status", id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(status.content[0].text, /kind: maos\.eval/);
+    assert.match(status.content[0].text, /run: decision-quality/);
+    assert.match(status.content[0].text, /eval phase: running/);
+    assert.match(status.content[0].text, /eval profile: heavy · fable/);
+    assert.match(status.content[0].text, /eval workspace: \/tmp\/eval-rift/);
+    assert.match(status.content[0].text, /summary: .*eval-report\.md/);
+    assert.doesNotMatch(status.content[0].text, /must-not-render/);
+    assert.equal(status.details.metadata.kind, "maos.eval");
+  });
+});
+
+test("job: typed metadata requires kind and validates paths", async () => {
+  await withJobsDir(async (_dir, { tools, ctx }) => {
+    const job = tools.get("job")!;
+    await assert.rejects(
+      job.execute(
+        "typed-job-missing-kind",
+        { action: "run", command: "true", runId: "x", wake: "never" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /kind is required/,
+    );
+    await assert.rejects(
+      job.execute(
+        "typed-job-bad-kind",
+        { action: "run", command: "true", kind: "Bad Kind", wake: "never" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /kind must be/,
+    );
+  });
+});
+
 test("job: cancel terminates a running process without a completion wake", async () => {
   await withJobsDir(async (_dir, { tools, ctx, wakes }) => {
     const job = tools.get("job")!;
