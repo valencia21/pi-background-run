@@ -34,7 +34,15 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Box, Text } from "@earendil-works/pi-tui";
+import {
+  Box,
+  Key,
+  matchesKey,
+  Text,
+  truncateToWidth,
+  wrapTextWithAnsi,
+  type AutocompleteItem,
+} from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import {
   appendFileSync,
@@ -3849,76 +3857,308 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Slash commands: human-facing mirrors of the read/clean tools ───────────
-  //
-  // pi.registerTool registers AGENT tools; slash commands need a separate
-  // pi.registerCommand registration. These let the human check jobs or prune
-  // logs directly from the TUI without asking the agent. /bgrun is
-  // deliberately NOT a command — starting jobs (and reacting to their wakes)
-  // is the agent's workflow.
+  // ── Slash commands: human-facing mirror of the unified job tool ────────────
 
+  type CommandResult = {
+    content: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+  };
+
+  function commandText(result: CommandResult): string {
+    return result.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text ?? "")
+      .join("\n");
+  }
+
+  async function showCommandResult(
+    title: string,
+    result: CommandResult,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    if (!ctx.hasUI) return;
+    const text = commandText(result);
+    const kind = result.isError ? "error" : "info";
+    // RPC has no terminal overlay. Keep the same result available there as a
+    // notification; the TUI gets a persistent, scrollable pager instead of a
+    // transient toast.
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify(text, kind);
+      return;
+    }
+    await ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) => {
+        let offset = 0;
+        let maxOffset = 0;
+        const pageSize = 20;
+        return {
+          render(width: number): string[] {
+            const bodyWidth = Math.max(1, width - 2);
+            const wrapped = text.split("\n").flatMap((line) => {
+              const lines = wrapTextWithAnsi(line, bodyWidth);
+              return lines.length > 0 ? lines : [""];
+            });
+            maxOffset = Math.max(0, wrapped.length - pageSize);
+            offset = Math.min(offset, maxOffset);
+            const body = wrapped.slice(offset, offset + pageSize);
+            const position =
+              maxOffset > 0
+                ? ` · lines ${offset + 1}-${offset + body.length}/${wrapped.length}`
+                : "";
+            return [
+              truncateToWidth(
+                ` ${theme.fg(result.isError ? "error" : "accent", theme.bold(title))}${theme.fg("dim", position)}`,
+                width,
+              ),
+              ...body.map((line) =>
+                truncateToWidth(` ${theme.fg("toolOutput", line)}`, width),
+              ),
+              truncateToWidth(
+                theme.fg(
+                  "dim",
+                  ` ↑↓ scroll · ${keyHint("app.tools.expand", "PgUp/PgDn")} page · enter/esc/q close`,
+                ),
+                width,
+              ),
+            ];
+          },
+          handleInput(data: string): void {
+            if (
+              matchesKey(data, Key.escape) ||
+              matchesKey(data, Key.enter) ||
+              data === "q"
+            ) {
+              done(undefined);
+              return;
+            }
+            if (matchesKey(data, Key.up)) offset = Math.max(0, offset - 1);
+            else if (matchesKey(data, Key.down))
+              offset = Math.min(maxOffset, offset + 1);
+            else if (data === "\x1b[5~")
+              offset = Math.max(0, offset - pageSize);
+            else if (data === "\x1b[6~")
+              offset = Math.min(maxOffset, offset + pageSize);
+            else return;
+            tui.requestRender();
+          },
+          invalidate(): void {},
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: { width: "90%", minWidth: 40, maxHeight: "80%" },
+      },
+    );
+  }
+
+  async function showCommandError(
+    message: string,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    await showCommandResult(
+      "job",
+      { content: [{ type: "text", text: message }], isError: true },
+      ctx,
+    );
+  }
+
+  function commandCompletions(prefix: string): AutocompleteItem[] | null {
+    const actions = ["status", "tail", "grep", "cancel", "clean", "run", "help"];
+    const trimmed = prefix.trimStart();
+    if (!trimmed.includes(" ")) {
+      const items = actions
+        .filter((action) => action.startsWith(trimmed))
+        .map((action) => ({ value: action, label: action }));
+      return items.length > 0 ? items : null;
+    }
+    const [action, partial = ""] = trimmed.split(/\s+/, 2);
+    if (!["status", "tail", "grep", "cancel"].includes(action)) return null;
+    const items = [...jobs.keys()]
+      .filter((id) => id.startsWith(partial))
+      .map((id) => ({ value: `${action} ${id}`, label: id }));
+    return items.length > 0 ? items : null;
+  }
+
+  const jobUsage = [
+    "Usage:",
+    "  /job status [id] [--done]",
+    "  /job tail <id> [lines]",
+    "  /job grep <id> <pattern>",
+    "  /job cancel <id>",
+    "  /job clean [days] [--all]",
+    "  /job run --wake <never|failure|always> [--name <name>] -- <command>",
+  ].join("\n");
+
+  pi.registerCommand("job", {
+    description: "Run, inspect, cancel, and clean background jobs",
+    getArgumentCompletions: commandCompletions,
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const input = (args ?? "").trim();
+      const firstSpace = input.search(/\s/);
+      const action = (
+        firstSpace < 0 ? input || "status" : input.slice(0, firstSpace)
+      ).toLowerCase();
+      const rest = firstSpace < 0 ? "" : input.slice(firstSpace).trim();
+      try {
+        let result: CommandResult;
+        switch (action) {
+          case "help":
+            result = { content: [{ type: "text", text: jobUsage }] };
+            break;
+          case "status": {
+            const tokens = rest.split(/\s+/).filter(Boolean);
+            const includeDone = tokens.some((token) =>
+              ["--done", "done", "all"].includes(token.toLowerCase()),
+            );
+            const id = tokens.find(
+              (token) =>
+                !["--done", "done", "all"].includes(token.toLowerCase()),
+            );
+            result = await bgstatusCore(
+              { id, includeDone: includeDone || undefined },
+              ctx,
+            );
+            break;
+          }
+          case "tail": {
+            const [id, linesToken] = rest.split(/\s+/).filter(Boolean);
+            if (!id) throw new Error("Usage: /job tail <id> [lines]");
+            const lines = linesToken === undefined ? undefined : Number(linesToken);
+            if (lines !== undefined && (!Number.isFinite(lines) || lines <= 0))
+              throw new Error("job tail: lines must be a positive number");
+            result = await bgtailCore({ id, lines }, ctx);
+            break;
+          }
+          case "grep": {
+            const match = rest.match(/^(\S+)\s+([\s\S]+)$/);
+            if (!match) throw new Error("Usage: /job grep <id> <pattern>");
+            result = await bggrepCore({ id: match[1], pattern: match[2] }, ctx);
+            break;
+          }
+          case "cancel": {
+            const tokens = rest.split(/\s+/).filter(Boolean);
+            if (tokens.length !== 1)
+              throw new Error("Usage: /job cancel <id>");
+            result = await cancelJobCore({ id: tokens[0] }, ctx);
+            break;
+          }
+          case "clean": {
+            const tokens = rest.split(/\s+/).filter(Boolean);
+            const all = tokens.some((token) =>
+              ["--all", "all"].includes(token.toLowerCase()),
+            );
+            const daysToken = tokens.find((token) => /^\d+(\.\d+)?$/.test(token));
+            const unknown = tokens.find(
+              (token) =>
+                !["--all", "all"].includes(token.toLowerCase()) &&
+                token !== daysToken,
+            );
+            if (unknown) throw new Error(`job clean: unknown option ${unknown}`);
+            result = await bgcleanCore(
+              { days: daysToken === undefined ? undefined : Number(daysToken), all },
+              ctx,
+            );
+            break;
+          }
+          case "run": {
+            const separator = rest.match(/(?:^|\s)--(?:\s|$)/);
+            if (!separator)
+              throw new Error(
+                "Usage: /job run --wake <never|failure|always> [--name <name>] -- <command>",
+              );
+            const options = rest.slice(0, separator.index).trim().split(/\s+/).filter(Boolean);
+            const command = rest
+              .slice((separator.index ?? 0) + separator[0].length)
+              .trim();
+            if (!command) throw new Error("job run: command is required after --");
+            let wake: WakePolicy | undefined;
+            let name: string | undefined;
+            for (let i = 0; i < options.length; i++) {
+              const token = options[i];
+              if (token === "--wake") {
+                const value = options[++i];
+                wake = normalizeWakePolicy(value);
+                if (!wake)
+                  throw new Error("job run: --wake must be never, failure, or always");
+              } else if (token === "--name") {
+                name = options[++i];
+                if (!name) throw new Error("job run: --name requires a value");
+              } else {
+                throw new Error(`job run: unknown option ${token}`);
+              }
+            }
+            if (!wake)
+              throw new Error("job run: explicit --wake policy is required");
+            result = await bgrunTool.execute(
+              "slash-job-run",
+              { command, name, wake },
+              undefined,
+              undefined,
+              ctx,
+            );
+            break;
+          }
+          default:
+            throw new Error(`job: unknown action ${action}\n\n${jobUsage}`);
+        }
+        await showCommandResult(`job ${action}`, result, ctx);
+      } catch (err) {
+        await showCommandError(err instanceof Error ? err.message : String(err), ctx);
+      }
+    },
+  });
+
+  // Compatibility aliases. /job is the documented command surface.
   pi.registerCommand("bgstatus", {
-    description: "Background jobs: status (/bgstatus [id] [done])",
+    description: "Compatibility alias for /job status",
     handler: async (args: string, ctx: ExtensionContext) => {
       const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const includeDone = tokens.some((t) =>
-        ["done", "all"].includes(t.toLowerCase()),
+      const includeDone = tokens.some((token) =>
+        ["done", "all"].includes(token.toLowerCase()),
       );
-      const id = tokens.find((t) => !["done", "all"].includes(t.toLowerCase()));
-      const res = await bgstatusCore(
+      const id = tokens.find(
+        (token) => !["done", "all"].includes(token.toLowerCase()),
+      );
+      const result = await bgstatusCore(
         { id, includeDone: includeDone || undefined },
         ctx,
       );
-      if (ctx.hasUI) {
-        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
-      }
+      await showCommandResult("job status", result, ctx);
     },
   });
 
   pi.registerCommand("bgtail", {
-    description: "Background jobs: tail a log (/bgtail <id> [lines])",
+    description: "Compatibility alias for /job tail",
     handler: async (args: string, ctx: ExtensionContext) => {
-      const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const id = tokens[0];
+      const [id, linesToken] = (args ?? "").trim().split(/\s+/).filter(Boolean);
       if (!id) {
-        if (ctx.hasUI) {
-          ctx.ui.notify("Usage: /bgtail <job-id> [lines]", "error");
-        }
+        await showCommandError("Usage: /bgtail <job-id> [lines]", ctx);
         return;
       }
-      const n = Number(tokens[1]);
-      const res = await bgtailCore(
-        { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
-        ctx,
-      );
-      if (ctx.hasUI) {
-        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
+      const lines = linesToken === undefined ? undefined : Number(linesToken);
+      if (lines !== undefined && (!Number.isFinite(lines) || lines <= 0)) {
+        await showCommandError("bgtail: lines must be a positive number", ctx);
+        return;
       }
+      const result = await bgtailCore({ id, lines }, ctx);
+      await showCommandResult("job tail", result, ctx);
     },
   });
 
   pi.registerCommand("bgclean", {
-    description: "Background jobs: remove old logs (/bgclean [days] [all])",
+    description: "Compatibility alias for /job clean",
     handler: async (args: string, ctx: ExtensionContext) => {
-      const tokens = (args ?? "")
-        .trim()
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(Boolean);
-      const daysToken = Number(tokens.find((t) => /^\d+(\.\d+)?$/.test(t)));
+      const tokens = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const daysToken = tokens.find((token) => /^\d+(\.\d+)?$/.test(token));
       const all = tokens.includes("all");
       try {
-        const res = await bgcleanCore(
-          { days: Number.isFinite(daysToken) ? daysToken : undefined, all },
+        const result = await bgcleanCore(
+          { days: daysToken === undefined ? undefined : Number(daysToken), all },
           ctx,
         );
-        if (ctx.hasUI) {
-          ctx.ui.notify(res.content[0].text, "info");
-        }
+        await showCommandResult("job clean", result, ctx);
       } catch (err) {
-        if (ctx.hasUI) {
-          ctx.ui.notify(String(err), "error");
-        }
+        await showCommandError(err instanceof Error ? err.message : String(err), ctx);
       }
     },
   });

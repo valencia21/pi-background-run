@@ -2271,7 +2271,7 @@ test("bgclean: does not remove a running job's log", async () => {
   }
 });
 
-test("slash commands: /bgstatus, /bgtail, /bgclean registered and share the tool logic", async () => {
+test("slash commands: /job mirrors every unified action and keeps compatibility aliases", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   delete process.env.PI_BGRUN_FOREIGN_JOBS;
@@ -2284,11 +2284,12 @@ test("slash commands: /bgstatus, /bgtail, /bgclean registered and share the tool
 
     await loadExtension(pi);
 
-    // All three human-facing commands are registered (/bgrun is agent-only).
-    assert.ok(commands.has("bgstatus"), "/bgstatus registered");
-    assert.ok(commands.has("bgtail"), "/bgtail registered");
-    assert.ok(commands.has("bgclean"), "/bgclean registered");
-    assert.ok(!commands.has("bgrun"), "/bgrun deliberately not a command");
+    // /job is canonical; the old read/clean commands remain aliases.
+    assert.ok(commands.has("job"), "/job registered");
+    assert.ok(commands.has("bgstatus"), "/bgstatus alias registered");
+    assert.ok(commands.has("bgtail"), "/bgtail alias registered");
+    assert.ok(commands.has("bgclean"), "/bgclean alias registered");
+    assert.ok(!commands.has("bgrun"), "/bgrun is not advertised separately");
 
     // Run a real job to completion so there's something to inspect.
     const bgrun = tools.get("bgrun")!;
@@ -2302,47 +2303,62 @@ test("slash commands: /bgstatus, /bgtail, /bgclean registered and share the tool
     const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
     await waitForWakes(wakes, 1);
 
-    // /bgstatus <id> → single-job status via notify.
-    await commands.get("bgstatus")!.handler(id, ctx);
+    // Canonical status, tail, and grep actions share the bounded core logic.
+    await commands.get("job")!.handler(`status ${id}`, ctx);
     assert.ok(
       notes.some((n) => n.text.includes(id) && /: done/.test(n.text)),
-      "/bgstatus <id> notifies job status",
+      "/job status <id> shows job status",
     );
-
-    // /bgstatus done → listing includes the finished job.
-    await commands.get("bgstatus")!.handler("done", ctx);
+    await commands.get("job")!.handler("status --done", ctx);
     assert.ok(
       notes.some((n) => /mirror-job: done exit=0/.test(n.text)),
-      "/bgstatus done lists finished jobs",
+      "/job status --done lists finished jobs",
     );
-
-    // /bgtail <id> <lines> → condensed tail via notify.
-    await commands.get("bgtail")!.handler(`${id} 5`, ctx);
+    await commands.get("job")!.handler(`tail ${id} 5`, ctx);
     assert.ok(
       notes.some((n) => n.text.includes("cmd-mirror")),
-      "/bgtail notifies the log tail",
+      "/job tail shows the log tail",
     );
-
-    // /bgtail with no args → usage error.
-    await commands.get("bgtail")!.handler("", ctx);
+    await commands.get("job")!.handler(`grep ${id} cmd-mirror`, ctx);
     assert.ok(
-      notes.some((n) => n.kind === "error" && /Usage: \/bgtail/.test(n.text)),
-      "/bgtail without id shows usage",
+      notes.some((n) => /1 match/.test(n.text) && n.text.includes("cmd-mirror")),
+      "/job grep shows bounded matches",
     );
 
-    // /bgclean (no args) → session-scoped summary via notify.
-    await commands.get("bgclean")!.handler("", ctx);
+    // Run requires an explicit wake policy and `--` command separator.
+    await commands.get("job")!.handler("run -- sleep 30", ctx);
     assert.ok(
-      notes.some((n) => /removed 0 job log\(s\) \(this session\)/.test(n.text)),
-      "/bgclean notifies the session-scoped summary",
+      notes.some(
+        (n) => n.kind === "error" && /explicit --wake policy is required/.test(n.text),
+      ),
+      "/job run rejects an implicit wake policy",
+    );
+    await commands
+      .get("job")!
+      .handler("run --wake never --name slash-cancel -- sleep 30", ctx);
+    const started = notes
+      .map((n) => n.text.match(/^started: ([^\n]+)/)?.[1])
+      .find((value): value is string => Boolean(value));
+    assert.ok(started, "/job run starts a managed job");
+    await commands.get("job")!.handler(`cancel ${started}`, ctx);
+    assert.ok(
+      notes.some((n) => /cancellation requested/.test(n.text)),
+      "/job cancel requests process-group cancellation",
     );
 
-    // /bgclean 7 all → global scope.
+    await commands.get("job")!.handler("help", ctx);
+    assert.ok(notes.some((n) => n.text.includes("/job status")));
+    await commands.get("job")!.handler("clean", ctx);
+    assert.ok(
+      notes.some((n) => /job log\(s\) \(this session\)/.test(n.text)),
+      "/job clean reports its session scope",
+    );
+
+    // Compatibility aliases still reach the same cores.
+    await commands.get("bgstatus")!.handler(id, ctx);
+    await commands.get("bgtail")!.handler(`${id} 5`, ctx);
     await commands.get("bgclean")!.handler("7 all", ctx);
-    assert.ok(
-      notes.some((n) => /\(all sessions\)/.test(n.text)),
-      "/bgclean all notifies the global summary",
-    );
+    assert.ok(notes.some((n) => /\(all sessions\)/.test(n.text)));
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });

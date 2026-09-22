@@ -66,19 +66,22 @@ category alone.
 
 ## Slash commands
 
-Human-facing mirrors of the read/clean tools, usable directly in the TUI
-without asking the agent (registered via `pi.registerCommand` — a separate
-registration from the agent tools above, which is why tools alone never show
-up as `/` commands):
+`/job` mirrors the unified agent tool for direct use in the TUI. Results open
+in a persistent pager (`↑`/`↓`, Page Up/Page Down, Enter/Escape/`q` to close)
+instead of disappearing in a notification.
 
 | Command | Purpose |
 | --- | --- |
-| `/bgstatus [id] [done]` | One job's status by id, or the session listing (`done`/`all` includes finished jobs). |
-| `/bgtail <id> [lines]` | Tail a job's log (condensed, same as the tool). |
-| `/bgclean [days] [all]` | Remove old logs — session-scoped by default; `all` sweeps every session's. |
+| `/job` or `/job status [id] [--done]` | List running jobs, inspect one id, or include completed jobs. |
+| `/job tail <id> [lines]` | Tail a job's condensed log. |
+| `/job grep <id> <pattern>` | Search a job's bounded log window with a regular expression. |
+| `/job cancel <id>` | Send SIGTERM to the exact job's detached process group. |
+| `/job clean [days] [--all]` | Remove old logs, session-scoped unless `--all` is present. |
+| `/job run --wake <never\|failure\|always> [--name <name>] -- <command>` | Start a managed job with an explicit wake policy. |
+| `/job help` | Show command usage. |
 
-`/bgrun` is deliberately not a command — starting jobs (and reacting to their
-wake messages) is the agent's workflow.
+`/bgstatus`, `/bgtail`, and `/bgclean` remain compatibility aliases. There are
+no separate `/bgrun`, `/bggrep`, or `/bgcancel` commands.
 
 ## Roadmap / not provided
 
