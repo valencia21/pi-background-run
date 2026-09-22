@@ -2493,7 +2493,7 @@ export default function (pi: ExtensionAPI) {
             if (digestBlock) {
               wakeMessage += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
             }
-            wakeMessage += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
+            wakeMessage += `Review the result now: call \`job\` with action \`tail\` and this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
             try {
               if (rec.ctx.isIdle()) {
                 pi.sendUserMessage(wakeMessage);

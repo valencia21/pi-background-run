@@ -4995,7 +4995,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     assert.equal(lines[3], "Last output: hello world");
     assert.equal(
       lines[4],
-      "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
+      "Review the result now: call `job` with action `tail` and this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
     );
     assert.ok(!wake.includes("digest ("));
   } finally {
