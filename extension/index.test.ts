@@ -120,6 +120,7 @@ type UsedExtensionAPI = Pick<
   | "registerEntryRenderer"
   | "sendUserMessage"
   | "appendEntry"
+  | "events"
 >;
 
 // Tools as the tests consume them: real metadata types from ToolDefinition, but
@@ -173,6 +174,7 @@ interface FakePiHandles {
   pi: ExtensionAPI;
   wakes: CapturedWake[];
   entries: CapturedEntry[];
+  jobStatuses: Array<{ running: number; tracked: number }>;
   tools: Map<string, FakeTool>;
   commands: Map<string, FakeCommand>;
   entryRenderers: Map<string, FakeRenderer>;
@@ -193,6 +195,7 @@ function makeFakePi(
   const entries: CapturedEntry[] = opts.priorEntries
     ? [...opts.priorEntries]
     : [];
+  const jobStatuses: Array<{ running: number; tracked: number }> = [];
   const tools = new Map<string, FakeTool>();
   const commands = new Map<string, FakeCommand>();
   const entryRenderers = new Map<string, FakeRenderer>();
@@ -210,6 +213,12 @@ function makeFakePi(
   // compile-time drift guard. `as ExtensionAPI` below is the unavoidable seam
   // (the fake is deliberately partial); the *shapes* here are the real ones.
   const used: UsedExtensionAPI = {
+    events: {
+      emit(name: string, data: unknown) {
+        if (name === "bgrun:status")
+          jobStatuses.push(data as { running: number; tracked: number });
+      },
+    } as ExtensionAPI["events"],
     sendUserMessage(content, options) {
       wakes.push({
         text: content as string,
@@ -256,6 +265,7 @@ function makeFakePi(
     pi,
     wakes,
     entries,
+    jobStatuses,
     tools,
     commands,
     entryRenderers,
@@ -523,6 +533,23 @@ test("bgrun: successful command writes log + exit marker and wakes with ✅", as
     const log = readFileSync(logPath, "utf8");
     assert.match(log, /hello world/);
     assert.match(log, /__BGRUN_EXIT__=0/);
+  });
+});
+
+test("bgrun: emits compact running-job status for footer integrations", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { jobStatuses, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    await bgrun.execute(
+      "footer-status",
+      { command: "sleep 0.1", wake: "never" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(jobStatuses.at(-1)?.running, 1);
+    await new Promise((resolve) => setTimeout(resolve, 175));
+    assert.equal(jobStatuses.at(-1)?.running, 0);
   });
 });
 

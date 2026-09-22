@@ -677,6 +677,9 @@ interface BgrunConfig {
   // Include finished jobs in bgstatus listings by default. Default false —
   // completed jobs are noise; ask for them explicitly (bgstatus includeDone).
   showCompletedJobs: boolean;
+  // Render the built-in multiline status widget. Integrations can disable it
+  // and consume the `bgrun:status` event in a compact footer instead.
+  showWidget: boolean;
   // Default policy for injecting a completion message into the model turn.
   // Human toast/widget updates are independent and always remain enabled.
   defaultWake: WakePolicy;
@@ -714,6 +717,7 @@ interface BgrunConfigFile {
   jobsDir?: unknown;
   adoptForeignJobs?: unknown;
   showCompletedJobs?: unknown;
+  showWidget?: unknown;
   defaultWake?: unknown;
   cleanupDays?: unknown;
   maxLogBytes?: unknown;
@@ -1271,6 +1275,8 @@ export function resolveConfig(ctx?: {
     typeof merged.showCompletedJobs === "boolean"
       ? merged.showCompletedJobs
       : undefined;
+  const widgetFile =
+    typeof merged.showWidget === "boolean" ? merged.showWidget : undefined;
   const globalCleanFile =
     typeof merged.globalAutoClean === "boolean"
       ? merged.globalAutoClean
@@ -1348,6 +1354,8 @@ export function resolveConfig(ctx?: {
       parseBoolEnv(process.env.PI_BGRUN_SHOW_COMPLETED) ??
       completedFile ??
       false,
+    showWidget:
+      parseBoolEnv(process.env.PI_BGRUN_SHOW_WIDGET) ?? widgetFile ?? true,
     // Preserve the package's historical behavior unless the user/project opts
     // into quieter defaults. Each bgrun call can still override this policy.
     defaultWake: wakeEnv ?? wakeFile ?? "always",
@@ -1604,12 +1612,16 @@ export default function (pi: ExtensionAPI) {
     // Reconciliation is lifecycle state, not a UI side effect. Headless/RPC
     // sessions must persist terminal evidence too.
     revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
-    if (!ctx.hasUI) return;
     const running: JobRecord[] = [];
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
     }
-    if (running.length === 0) {
+    pi.events.emit("bgrun:status", {
+      running: running.length,
+      tracked: jobs.size,
+    });
+    if (!ctx.hasUI) return;
+    if (!resolveConfig(ctx).showWidget || running.length === 0) {
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
