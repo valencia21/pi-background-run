@@ -1658,6 +1658,9 @@ export default function (pi: ExtensionAPI) {
   // after a restart). No exit event exists for those, so their logs/pids are
   // re-checked on an interval instead.
   let stalePoller: ReturnType<typeof setInterval> | undefined;
+  // Latest live session context, used when another extension starts a job
+  // through the event bus rather than through a model tool call.
+  let sessionCtx: ExtensionContext | undefined;
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2333,6 +2336,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     disposed = false;
+    sessionCtx = ctx;
     // A single extension instance can observe a session switch. Never carry
     // another session's in-memory ownership into the new session.
     jobs.clear();
@@ -2430,6 +2434,7 @@ export default function (pi: ExtensionAPI) {
     // Invalidate before any cleanup. A child may complete while shutdown is in
     // progress, but this generation must never call Pi APIs afterward.
     disposed = true;
+    sessionCtx = undefined;
     stopStalePoller();
     for (const rec of jobs.values()) {
       if (!rec.child) continue;
@@ -2983,6 +2988,45 @@ export default function (pi: ExtensionAPI) {
     },
   });
   pi.registerTool(bgrunTool);
+
+  // Generic programmatic entry point for other extensions. The requester gets
+  // exactly the same job lifecycle as the model-facing tool: detached process,
+  // log, wake policy and universal observation. There are no job kinds here;
+  // the command owns its domain and reports through PI_JOB_OBSERVATION_PATH.
+  //   pi.events.emit("bgrun:run", { command, name?, type?, wake?, ctx?, reply })
+  // reply(error) or reply(undefined, { id, logPath, observationPath, pid, wake }).
+  pi.events.on("bgrun:run", async (data) => {
+    const request = data as {
+      command?: unknown;
+      name?: unknown;
+      type?: unknown;
+      wake?: unknown;
+      ctx?: ExtensionContext;
+      reply?: (error: Error | undefined, result?: unknown) => void;
+    };
+    if (!request || typeof request.reply !== "function") return;
+    try {
+      if (typeof request.command !== "string")
+        throw new Error("bgrun:run: command is required");
+      const ctx = request.ctx ?? sessionCtx;
+      if (!ctx) throw new Error("bgrun:run: no active session");
+      const result = await bgrunTool.execute(
+        "bgrun:run",
+        {
+          command: request.command,
+          name: typeof request.name === "string" ? request.name : undefined,
+          type: typeof request.type === "string" ? request.type : undefined,
+          wake: normalizeWakePolicy(request.wake),
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      request.reply(undefined, result.details);
+    } catch (error) {
+      request.reply(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
 
   // ── Log condenser: ANSI strip, per-line cap, collapse runs, total budget ────
   // Keeps bgtail output small enough that a "quick peek" never floods context:

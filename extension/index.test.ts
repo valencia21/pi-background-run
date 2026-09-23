@@ -201,6 +201,7 @@ function makeFakePi(
   const commands = new Map<string, FakeCommand>();
   const entryRenderers = new Map<string, FakeRenderer>();
   const handlers = new Map<string, FakeHandler[]>();
+  const busHandlers = new Map<string, Array<(data: unknown) => unknown>>();
   const idle = opts.idle ?? true;
   const ctx = {
     isIdle: () => idle,
@@ -218,6 +219,16 @@ function makeFakePi(
       emit(name: string, data: unknown) {
         if (name === "bgrun:status")
           jobStatuses.push(data as { running: number; tracked: number });
+        for (const handler of busHandlers.get(name) ?? []) void handler(data);
+      },
+      on(name: string, handler: (data: unknown) => unknown) {
+        const list = busHandlers.get(name) ?? [];
+        list.push(handler);
+        busHandlers.set(name, list);
+        return () => {
+          const current = busHandlers.get(name) ?? [];
+          busHandlers.set(name, current.filter((h) => h !== handler));
+        };
       },
     } as ExtensionAPI["events"],
     sendUserMessage(content, options) {
@@ -412,6 +423,38 @@ test("job: unified tool dispatches run, status, tail, and grep", async () => {
       ctx,
     );
     assert.equal(grep.details.matches, 1);
+  });
+});
+
+test("bgrun:run event starts an ordinary observable job for other extensions", async () => {
+  await withJobsDir(async (_dir, { pi, tools, ctx, fireSessionStart }) => {
+    await fireSessionStart();
+    const payload = JSON.stringify({
+      version: 1, seq: 1, updatedAt: "2026-09-23T00:00:00.000Z",
+      status: "succeeded", summary: "worker done",
+    });
+    const started = await new Promise<any>((resolve, reject) =>
+      pi.events.emit("bgrun:run", {
+        command: `printf '%s' '${payload}' > "$PI_JOB_OBSERVATION_PATH"`,
+        name: "event-job",
+        wake: "never",
+        reply: (error: Error | undefined, result?: unknown) =>
+          error ? reject(error) : resolve(result),
+      }),
+    );
+    assert.match(started.id, /^event-job-/);
+    assert.equal(started.wake, "never");
+    await waitForLogExit(started.logPath);
+    const status = await tools.get("job")!.execute(
+      "event-status", { action: "status", id: started.id }, undefined, undefined, ctx,
+    );
+    assert.equal(status.details.verdict, "succeeded");
+    assert.equal(status.details.observation.summary, "worker done");
+
+    const rejected = await new Promise<Error | undefined>((resolve) =>
+      pi.events.emit("bgrun:run", { reply: (error: Error | undefined) => resolve(error) }),
+    );
+    assert.match(String(rejected?.message), /command is required/);
   });
 });
 
